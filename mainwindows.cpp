@@ -1,13 +1,14 @@
 #include "mainwindows.h"
 #include <QDebug>
 // CREATE USER 'orinnx'@'localhost' IDENTIFIED BY 'OrinX!2024';
-
+//CREATE USER 'recorder'@'localhost' IDENTIFIED BY 'OTL324$a';
 mainwindows::mainwindows(QObject *parent)
     : QObject(parent)
 {
     qDebug() << "hello world";
     SocketServer = new ChatServer(1234);
-    mysql = new Database("iRecord", "orinnx", "OrinX!2024", "localhost", this);
+//    mysql = new Database("iRecord", "orinnx", "OrinX!2024", "localhost", this);
+//    mydatabase = new Database("recorder", "root", "OTL324$", "localhost", this);
     mydatabase = new Database("recorder", "root", "OTL324$", "localhost", this);
     networking = new NetworkMng(this);
     displayInfo = new infoDisplay(this);
@@ -15,6 +16,8 @@ mainwindows::mainwindows(QObject *parent)
     max31760 = new MAX31760(this);
     QTimer *timer = new QTimer(this);
     dashboardTimer = new QTimer(this);
+    downloader = new FileDownloader;
+
     wClient = new QWebSocket();
     Timer = new QTimer();
     client = new SocketClient();
@@ -32,7 +35,7 @@ mainwindows::mainwindows(QObject *parent)
     uint32_t sysclkHz = 12000000;
     uint32_t sampleRate = 8000;
 //     Connect WebSocketClient to localhost:1235
-    client->createConnection("127.0.0.1", 1236);
+    client->createConnection("127.0.0.1", 1237);
 
     connect(client, &SocketClient::Connected, this, []() {
         qDebug() << "mainwindows: SocketClient connected!";
@@ -42,18 +45,20 @@ mainwindows::mainwindows(QObject *parent)
 
         QJsonParseError parseError;
         QJsonDocument doc = QJsonDocument::fromJson(msg.toUtf8(), &parseError);
+
         if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
             QJsonObject obj = doc.object();
-            if (obj["menuID"] == "rec_event") {
-                QJsonObject request;
-                request["menuID"] = "requestIpDevice";
-                QJsonDocument requestDoc(request);
-                QString requestMsg = QString::fromUtf8(requestDoc.toJson(QJsonDocument::Compact));
-                client->sendMessage(requestMsg);
-                qDebug() << "Sent requestIpDevice after successful connection.";
+            QString menuID = obj.value("menuID").toString();
+            QString messageText = obj.value("message").toString();
+
+            if (menuID == "rec_event") {
+                manageData(msg, wClient);
             }
+        } else {
+            qDebug() << "Parse error:" << parseError.errorString();
         }
-    });;
+    });
+
 
     connect(wClient, &QWebSocket::connected, this, []() {
     qDebug() << "WebSocket connected!";});
@@ -67,15 +72,15 @@ mainwindows::mainwindows(QObject *parent)
 //--------------------------------------networking------------------------------------------------//
     connect(networking, SIGNAL(networkmsg( QString)), this, SLOT(mesgManagement( QString)));
     connect(this, &mainwindows::updateNetwork, networking, &NetworkMng::setStaticIpAddr3);
-//    connect(this, SIGNAL(updateNetwork(QString,QString,QString,QString,QString,QString,QString)), networking, SLOT(setStaticIpAddr3(QString,QString,QString,QString,QString,QString)));
 //-------------------------------------mydatabase------------------------------------------------//
-    connect(mysql, SIGNAL(previousRecordVolume( QString)), this, SLOT(updateNewVolumeRecord( QString)));
+    connect(mydatabase, SIGNAL(previousRecordVolume( QString)), this, SLOT(updateNewVolumeRecord( QString)));
     connect(mydatabase, SIGNAL(sendRecordFiles(QString, QWebSocket*)), SocketServer, SLOT(sendMessage(QString, QWebSocket*)));
 //--------------------------------------WebServer------------------------------------------------//
     connect(SocketServer, SIGNAL(newCommandProcess(QString, QWebSocket*)), this, SLOT(manageData(QString, QWebSocket*)));
     connect(SocketServer, SIGNAL(newCommandProcess(QString, QWebSocket*)), this, SLOT(dashboardManage(QString, QWebSocket*)));
 
     connect(dashboardTimer, &QTimer::timeout, this, [=]() {dashboardManage(dashboardMsg, clientSocket);});
+    connect(downloader,SIGNAL(downloadCompleted(const QString)), this, SLOT(downloadCompleted(const QString)));
 
     int ret;
     ret=pthread_create(&idThread, NULL, ThreadFunc, this);
@@ -111,12 +116,15 @@ mainwindows::mainwindows(QObject *parent)
 //    displayThread();
     displayVolumes();
     verifySSDandBackupFile();
+    mydatabase->updateRecordVolume();
+    mydatabase->CheckandVerifyDatabases();
+    mydatabase->maybeRunCleanup();
 }
 
 void mainwindows::verifySSDandBackupFile() {
     struct statvfs buf;
 
-    QStringList devices = {"/dev/nvme1n1p1", "/dev/nvme2n1p1"};
+    QStringList devices = {"/dev/nvme1n1p1", "/dev/nvme2n1p1"}; //CheckandVerifyDatabases
     QStringList mountPoints = {"/media/SSD1", "/media/SSD2"};
 
     for (int i = 0; i < devices.size(); ++i) {
@@ -302,14 +310,14 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
         setdefaultPath(msgs, wClient);
 
         QFile file(FILESETTING);
+        QString currentRecordDirectory;
+
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            qDebug() << "Failed to open config file";
+            qDebug() << "Failed to open config file:" << FILESETTING;
             return;
         }
 
         QTextStream in(&file);
-        QString currentRecordDirectory;
-
         while (!in.atEnd()) {
             QString line = in.readLine().trimmed();
             if (line.startsWith("record_directory=")) {
@@ -317,14 +325,38 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
                 break;
             }
         }
-
         file.close();
 
         if (!currentRecordDirectory.isEmpty()) {
-            qDebug() << "Record directory:" << currentRecordDirectory;
+            qDebug() << "Record directory (FILESETTING):" << currentRecordDirectory;
         } else {
-            qDebug() << "record_directory not found in config";
+            qDebug() << "record_directory not found in FILESETTING";
         }
+
+        QFile fileInit(FILESETTINGPATH);
+        QString currentRecordDirectoryInit;
+
+        if (!fileInit.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qDebug() << "Failed to open config file:" << FILESETTINGPATH;
+            return;
+        }
+
+        QTextStream inInit(&fileInit);
+        while (!inInit.atEnd()) {
+            QString line = inInit.readLine().trimmed();
+            if (line.startsWith("record_directory=")) {
+                currentRecordDirectoryInit = line.section('=', 1);
+                break;
+            }
+        }
+        fileInit.close();
+
+        if (!currentRecordDirectoryInit.isEmpty()) {
+            qDebug() << "Record directory (FILESETTINGPATH):" << currentRecordDirectoryInit;
+        } else {
+            qDebug() << "record_directory not found in FILESETTINGPATH";
+        }
+
         QJsonObject mainObject;
         mainObject.insert("menuID", "currentDirectoryPath");
         mainObject.insert("currentRecordDirectory", currentRecordDirectory);
@@ -334,8 +366,8 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
 
         if (wClient) {
             wClient->sendTextMessage(jsonString);
+//            runBuildAndRestartServices();
         }
-
     }
 }
 
@@ -501,13 +533,96 @@ void mainwindows::manageData(QString megs, QWebSocket* wClient){
         mydatabase->CheckAndHandleDevice(megs,wClient);
     }else if (obj["menuID"].toString() == "updatePathDirectory") {
         mydatabase->UpdateDeviceInDatabase(megs,wClient);
-
         updateCurrentPathDirectory(megs,wClient);
 
-    }else if (obj["menuID"].toString() == "deleteDevice") {
+    }else if (obj["menuID"].toString() == "changePathDirectory") {
+        updateCurrentPathDirectory(megs,wClient);
+        mydatabase->updatePath(megs,wClient);
+
+    }else if (obj["menuID"].toString() == "playFileWav") {
+        qDebug() << "Received request to play file:" << megs;
+
+        QString fileName = obj["fileName"].toString().trimmed();
+        QString pathDirectory = obj["filePath"].toString().trimmed();
+
+        if (fileName.endsWith(".wav") && !pathDirectory.endsWith(".wav")) {
+            std::swap(fileName, pathDirectory);
+        }
+
+        QString fullPath = fileName+ "/" + pathDirectory;
+//        QString fullPath = pathDirectory+ "/" + fileName;
+
+        qDebug() << "Playing file from full path:" << fullPath << pathDirectory << fileName;
+
+        playWavFile(fullPath);
+    }
+else if (obj["menuID"].toString() == "deleteDevice") {
         mydatabase->removeRegisterDevice(megs,wClient);
     }else if (obj["menuID"].toString() == "selectPath") {
         handleSelectPath(obj, wClient);
+    }else if (obj["menuID"].toString() == "rec_event") { /// receive data from C record
+        qDebug() << "rec_event:" << megs;
+        mydatabase->recordChannel(megs,wClient);
+    }else if (obj["menuID"].toString() == "getRecordChannel") {
+        qDebug() << "getReccordChannel:" << megs;
+        mydatabase->selectRecordChannel(megs,wClient);
+    }else if (obj["menuID"].toString() == "startLiveStream") {
+        qDebug() << "startLiveStream:" << megs;
+        liveSteamRecordRaido(megs,wClient);
+    }else if (obj["menuID"].toString() == "updateFirmware") {
+        qDebug() << "updateFirmware:" << megs;
+        updateSystem(megs);
+    }else if (obj["menuID"].toString() == "formatExternal") {
+        qDebug() << "formatExternal:" << megs;
+        formatExternal(megs);
+    }else if (obj["menuID"].toString() == "getSystemPage") {
+        qDebug() << "getSystemPage:" << megs;
+
+        QString iRecord = "unknown";
+        QString swversion = "unknown";
+        QString hwversion = "unknown";
+
+        QFile file("/home/orinnx/README.txt");
+        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&file);
+            while (!in.atEnd()) {
+                QString line = in.readLine();
+
+                if (line.contains("iRecord")) {
+                    QRegularExpression re("iRecord\\s*=\\s*\"([^\"]+)\"");
+                    QRegularExpressionMatch match = re.match(line);
+                    if (match.hasMatch()) iRecord = match.captured(1);
+                }
+
+                if (line.contains("swversion")) {
+                    QRegularExpression re("swversion\\s*=\\s*\"([^\"]+)\"");
+                    QRegularExpressionMatch match = re.match(line);
+                    if (match.hasMatch()) swversion = match.captured(1);
+                }
+
+                if (line.contains("hwversion")) {
+                    QRegularExpression re("hwversion\\s*=\\s*\"([^\"]+)\"");
+                    QRegularExpressionMatch match = re.match(line);
+                    if (match.hasMatch()) hwversion = match.captured(1);
+                }
+            }
+            file.close();
+        }
+
+        // สร้าง JSON ส่งกลับ
+        QJsonObject reply;
+        reply["menuID"] = "system";
+        reply["firmwareVersion"] = iRecord;
+        reply["swversion"] = swversion;
+        reply["hwversion"] = hwversion;
+
+        QJsonDocument doc(reply);
+        QString jsonString = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+        qDebug() << "Sending systemPageInfo:" << jsonString;
+
+        if (wClient) {
+            wClient->sendTextMessage(jsonString);
+        }
     }
 
 }
@@ -516,93 +631,195 @@ void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) 
     QByteArray br = mesg.toUtf8();
     QJsonDocument doc = QJsonDocument::fromJson(br);
     QJsonObject obj = doc.object();
-    QJsonObject command = doc.object();
-    QString getCommand =  QJsonValue(obj["objectName"]).toString();
+
+    // Default values
     QString newPath = obj["pathDirectory"].toString().trimmed();
     int newInterval = obj["timeInterval"].toInt();
-    QString currentRecordDirectory;
-    int currentRecordInterval = -1;
-    QStringList lines;
 
-    QFile file(FILESETTING);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qDebug() << "Failed to open config file";
-        return;
+    // Alternate keys support
+    if (obj.contains("ChangePathDirectory")) {
+        newPath = obj["ChangePathDirectory"].toString().trimmed();
+    }
+    if (obj.contains("timeIntervalpath")) {
+        newInterval = obj["timeIntervalpath"].toInt();
     }
 
-    QTextStream in(&file);
-    while (!in.atEnd()) {
-        QString line = in.readLine();
-        QString trimmedLine = line.trimmed();
-        if (trimmedLine.startsWith("record_directory=")) {
-            currentRecordDirectory = trimmedLine.section('=', 1).trimmed();
-        }
-        if (trimmedLine.startsWith("record_interval=")) {
-            currentRecordInterval = trimmedLine.section('=', 1).toInt();
-        }
-        lines.append(line);
-    }
-    file.close();
+    QStringList configFiles = { FILESETTING, FILESETTINGPATH };
+    QString latestPath = "";
+    int latestInterval = -1;
 
-    // Update if different
-    bool updated = false;
+    for (const QString &configFilePath : configFiles) {
+        QFile file(configFilePath);
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qWarning() << "Failed to open config file:" << configFilePath;
+            continue;
+        }
 
-    if (newPath != currentRecordDirectory && !newPath.isEmpty()) {
-        qDebug() << "Updating record_directory from" << currentRecordDirectory << "to" << newPath;
-        for (int i = 0; i < lines.size(); ++i) {
-            if (lines[i].trimmed().startsWith("record_directory=")) {
-                lines[i] = QString("record_directory=%1").arg(newPath);
-                updated = true;
-                break;
+        QString currentRecordDirectory;
+        int currentRecordInterval = -1;
+        QStringList lines;
+        QTextStream in(&file);
+
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            QString trimmedLine = line.trimmed();
+            if (trimmedLine.startsWith("record_directory=")) {
+                currentRecordDirectory = trimmedLine.section('=', 1).trimmed();
+            }
+            if (trimmedLine.startsWith("record_interval=")) {
+                currentRecordInterval = trimmedLine.section('=', 1).toInt();
+            }
+            lines.append(line);
+        }
+        file.close();
+
+        // Update if necessary
+        bool updated = false;
+        if (newPath != currentRecordDirectory && !newPath.isEmpty()) {
+            qDebug() << "Updating record_directory in" << configFilePath << "to" << newPath;
+            for (int i = 0; i < lines.size(); ++i) {
+                if (lines[i].trimmed().startsWith("record_directory=")) {
+                    lines[i] = QString("record_directory=%1").arg(newPath);
+                    updated = true;
+                }
             }
         }
-    }
 
-    if (newInterval != currentRecordInterval && newInterval > 0) {
-        qDebug() << "Updating record_interval from" << currentRecordInterval << "to" << newInterval;
-        for (int i = 0; i < lines.size(); ++i) {
-            if (lines[i].trimmed().startsWith("record_interval=")) {
-                lines[i] = QString("record_interval=%1").arg(newInterval);
-                updated = true;
-                break;
+        if (newInterval != currentRecordInterval && newInterval > 0) {
+            qDebug() << "Updating record_interval in" << configFilePath << "to" << newInterval;
+            for (int i = 0; i < lines.size(); ++i) {
+                if (lines[i].trimmed().startsWith("record_interval=")) {
+                    lines[i] = QString("record_interval=%1").arg(newInterval);
+                    updated = true;
+                }
             }
         }
-    }
 
-    if (updated) {
-        QFile outFile(FILESETTING);
-        if (outFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-            QTextStream out(&outFile);
-            for (const QString &line : lines) {
-                out << line << "\n";
+        if (updated) {
+            QFile outFile(configFilePath);
+            if (outFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+                QTextStream out(&outFile);
+                for (const QString &line : lines)
+                    out << line << "\n";
+                outFile.close();
+            } else {
+                qWarning() << "Failed to write to config file:" << configFilePath;
             }
-            outFile.close();
-        } else {
-            qDebug() << "Failed to write updated config";
         }
-    } else {
-        qDebug() << "No changes to update.";
+
+        // Keep track of last updated for WebSocket reply
+        if (!newPath.isEmpty()) latestPath = newPath;
+        else if (!currentRecordDirectory.isEmpty()) latestPath = currentRecordDirectory;
+
+        if (newInterval > 0) latestInterval = newInterval;
+        else if (currentRecordInterval >= 0) latestInterval = currentRecordInterval;
     }
 
-    // Respond
+    // Send WebSocket response
     QJsonObject mainObject;
     mainObject.insert("menuID", "currentDirectoryPath");
-    mainObject.insert("currentRecordDirectory", newPath.isEmpty() ? currentRecordDirectory : newPath);
-    mainObject.insert("recordInterval", newInterval > 0 ? newInterval : currentRecordInterval);
+    mainObject.insert("currentRecordDirectory", latestPath);
+    mainObject.insert("recordInterval", latestInterval);
     QJsonDocument jsonDoc(mainObject);
     QString jsonString = jsonDoc.toJson(QJsonDocument::Compact);
 
     if (wClient) {
         wClient->sendTextMessage(jsonString);
+        runBuildAndRestartServices();
     }
 }
 
+
+//void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) {
+//    QByteArray br = mesg.toUtf8();
+//    QJsonDocument doc = QJsonDocument::fromJson(br);
+//    QJsonObject obj = doc.object();
+//    QJsonObject command = doc.object();
+//    QString getCommand =  QJsonValue(obj["objectName"]).toString();
+//    QString newPath = obj["pathDirectory"].toString().trimmed();
+//    int newInterval = obj["timeInterval"].toInt();
+//    QString currentRecordDirectory;
+//    int currentRecordInterval = -1;
+//    QStringList lines;
+
+//    QFile file(FILESETTING);
+//    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//        qDebug() << "Failed to open config file";
+//        return;
+//    }
+
+//    QTextStream in(&file);
+//    while (!in.atEnd()) {
+//        QString line = in.readLine();
+//        QString trimmedLine = line.trimmed();
+//        if (trimmedLine.startsWith("record_directory=")) {
+//            currentRecordDirectory = trimmedLine.section('=', 1).trimmed();
+//        }
+//        if (trimmedLine.startsWith("record_interval=")) {
+//            currentRecordInterval = trimmedLine.section('=', 1).toInt();
+//        }
+//        lines.append(line);
+//    }
+//    file.close();
+
+//    // Update if different
+//    bool updated = false;
+
+//    if (newPath != currentRecordDirectory && !newPath.isEmpty()) {
+//        qDebug() << "Updating record_directory from" << currentRecordDirectory << "to" << newPath;
+//        for (int i = 0; i < lines.size(); ++i) {
+//            if (lines[i].trimmed().startsWith("record_directory=")) {
+//                lines[i] = QString("record_directory=%1").arg(newPath);
+//                updated = true;
+//                break;            }
+//        }
+//    }
+
+//    if (newInterval != currentRecordInterval && newInterval > 0) {
+//        qDebug() << "Updating record_interval from" << currentRecordInterval << "to" << newInterval;
+//        for (int i = 0; i < lines.size(); ++i) {
+//            if (lines[i].trimmed().startsWith("record_interval=")) {
+//                lines[i] = QString("record_interval=%1").arg(newInterval);
+//                updated = true;
+//                break;
+//            }
+//        }
+//    }
+
+//    if (updated) {
+//        QFile outFile(FILESETTING);
+//        if (outFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+//            QTextStream out(&outFile);
+//            for (const QString &line : lines) {
+//                out << line << "\n";
+//            }
+//            outFile.close();
+//        } else {
+//            qDebug() << "Failed to write updated config";
+//        }
+//    } else {
+//        qDebug() << "No changes to update.";
+//    }
+
+//    // Respond
+//    QJsonObject mainObject;
+//    mainObject.insert("menuID", "currentDirectoryPath");
+//    mainObject.insert("currentRecordDirectory", newPath.isEmpty() ? currentRecordDirectory : newPath);
+//    mainObject.insert("recordInterval", newInterval > 0 ? newInterval : currentRecordInterval);
+//    QJsonDocument jsonDoc(mainObject);
+//    QString jsonString = jsonDoc.toJson(QJsonDocument::Compact);
+
+//    if (wClient) {
+//        wClient->sendTextMessage(jsonString);
+//    }
+//}
 
 
 void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
     QStringList filePaths = {
         FILESETTINGIP,
-        FILESETTING
+        FILESETTING,
+        FILESETTINGPATH // ✅ เพิ่มไฟล์นี้ตามที่ระบุ
     };
 
     for (const QString &filePath : filePaths) {
@@ -614,14 +831,21 @@ void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
 
         QStringList lines;
         QTextStream in(&file);
+        bool foundBindIp = false;
+
         while (!in.atEnd()) {
             QString line = in.readLine();
             if (line.trimmed().startsWith("bind_ip=")) {
                 line = "bind_ip=" + mesg;
+                foundBindIp = true;
             }
             lines << line;
         }
         file.close();
+
+        if (!foundBindIp) {
+            lines << "bind_ip=" + mesg;
+        }
 
         if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
             qWarning() << "Cannot open file for writing:" << filePath;
@@ -637,12 +861,63 @@ void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
         qDebug() << "Updated bind_ip in:" << filePath;
     }
 
-//    QJsonObject result;
-//    result["objectName"] = "configStatus";
-//    result["status"] = "ok";
-//    result["new_ip"] = mesg;
-//    emit sendRecordFiles(QJsonDocument(result).toJson(QJsonDocument::Compact), wClient);
+    // ✅ (ไม่จำเป็นแต่แนะนำ) ส่งผลลัพธ์กลับไปที่ client
+    if (wClient && wClient->isValid()) {
+        QJsonObject result;
+        result["menuID"] = "configStatus";
+        result["status"] = "ok";
+        result["updated_ip"] = mesg;
+        wClient->sendTextMessage(QJsonDocument(result).toJson(QJsonDocument::Compact));
+        runBuildAndRestartServices();
+    }
 }
+
+
+
+//void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
+//    QStringList filePaths = {
+//        FILESETTINGIP,
+//        FILESETTING
+//    };
+
+//    for (const QString &filePath : filePaths) {
+//        QFile file(filePath);
+//        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//            qWarning() << "Cannot open file for reading:" << filePath;
+//            continue;
+//        }
+
+//        QStringList lines;
+//        QTextStream in(&file);
+//        while (!in.atEnd()) {
+//            QString line = in.readLine();
+//            if (line.trimmed().startsWith("bind_ip=")) {
+//                line = "bind_ip=" + mesg;
+//            }
+//            lines << line;
+//        }
+//        file.close();
+
+//        if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+//            qWarning() << "Cannot open file for writing:" << filePath;
+//            continue;
+//        }
+
+//        QTextStream out(&file);
+//        for (const QString &line : lines) {
+//            out << line << "\n";
+//        }
+//        file.close();
+
+//        qDebug() << "Updated bind_ip in:" << filePath;
+//    }
+
+////    QJsonObject result;
+////    result["objectName"] = "configStatus";
+////    result["status"] = "ok";
+////    result["new_ip"] = mesg;
+////    emit sendRecordFiles(QJsonDocument(result).toJson(QJsonDocument::Compact), wClient);
+//}
 
 
 //void mainwindows::handleSelectPath(const QJsonObject &obj, QWebSocket* wClient) {
@@ -656,10 +931,10 @@ void mainwindows::handleSelectPath(const QJsonObject &obj, QWebSocket* wClient) 
     QString sourcePath = obj["path"].toString().trimmed();
     qDebug() << "Received sourcePath from JSON:" << sourcePath;
 
-    if (!sourcePath.endsWith('/')) {
-        sourcePath += '/';
-        qDebug() << "Appended '/' to sourcePath:" << sourcePath;
-    }
+//    if (!sourcePath.endsWith('/')) {
+//        sourcePath += '/';
+//        qDebug() << "Appended '/' to sourcePath:" << sourcePath;
+//    }
 
     if (!QDir(sourcePath).exists()) {
         qWarning() << "Source path does not exist:" << sourcePath;
@@ -687,11 +962,11 @@ void mainwindows::handleSelectPath(const QJsonObject &obj, QWebSocket* wClient) 
 }
 
 
-
-
 void mainwindows::getDateTime()
 {
-    currentDateTime = QDateTime::currentDateTime();
+
+    QDateTime currentDateTime = QDateTime::currentDateTime();
+//    qDebug() << "getDateTime:" << currentDateTime;
 
     const QDate d = currentDateTime.date();
     date = QString::number(d.year()) + '/'
@@ -759,12 +1034,10 @@ void mainwindows::DirectoryManagement(QString pathDirectory)
     }
 }
 
-
 void mainwindows::editfileConfig(QString mesg)
 {
     qDebug() << "editfileConfig received:" << mesg;
 
-    // Step 1: Parse JSON input
     QJsonParseError parseError;
     QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8(), &parseError);
     if (parseError.error != QJsonParseError::NoError) {
@@ -781,47 +1054,165 @@ void mainwindows::editfileConfig(QString mesg)
         return;
     }
 
-    const QString cfgfile = FILESETTING;
+    QStringList configFiles = {
+        FILESETTING,
+        FILESETTINGPATH
+    };
 
-    QFile file(cfgfile);
-    if (!file.exists()) {
-        qWarning() << "Configuration file does not exist:" << cfgfile;
-        return;
-    }
-
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "Failed to open config file for reading.";
-        return;
-    }
-
-    QTextStream in(&file);
-    QStringList lines;
-    while (!in.atEnd()) {
-        QString line = in.readLine();
-
-        if (line.trimmed().startsWith("record_interval=")) {
-            line = QString("record_interval=%1").arg(timeInterval);
-        } else if (line.trimmed().startsWith("record_directory=")) {
-            line = QString("record_directory=%1").arg(pathDirectory);
+    for (const QString &cfgfile : configFiles) {
+        QFile file(cfgfile);
+        if (!file.exists()) {
+            qWarning() << "Configuration file does not exist:" << cfgfile;
+            continue;
         }
 
-        lines << line;
-    }
-    file.close();
+        if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            qWarning() << "Failed to open for reading:" << cfgfile;
+            continue;
+        }
 
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-        qWarning() << "Failed to open config file for writing.";
-        return;
-    }
+        QTextStream in(&file);
+        QStringList lines;
+        bool foundDir = false, foundInterval = false;
 
-    QTextStream out(&file);
-    for (const QString &line : lines) {
-        out << line << '\n';
-    }
+        while (!in.atEnd()) {
+            QString line = in.readLine();
+            if (line.trimmed().startsWith("record_interval=")) {
+                line = QString("record_interval=%1").arg(timeInterval);
+                foundInterval = true;
+            } else if (line.trimmed().startsWith("record_directory=")) {
+                line = QString("record_directory=%1").arg(pathDirectory);
+                foundDir = true;
+            }
+            lines << line;
+        }
+        file.close();
 
-    file.close();
-    qDebug() << "Configuration file updated successfully.";
+        if (!foundInterval) {
+            lines << QString("record_interval=%1").arg(timeInterval);
+        }
+        if (!foundDir) {
+            lines << QString("record_directory=%1").arg(pathDirectory);
+        }
+
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            qWarning() << "Failed to open for writing:" << cfgfile;
+            continue;
+        }
+
+        QTextStream out(&file);
+        for (const QString &line : lines) {
+            out << line << '\n';
+        }
+        file.close();
+
+        qDebug() << "Updated config file:" << cfgfile;
+    }
+    runBuildAndRestartServices();
 }
+
+
+//void mainwindows::editfileConfig(QString mesg)
+//{
+//    qDebug() << "editfileConfig received:" << mesg;
+
+//    // Step 1: Parse JSON input
+//    QJsonParseError parseError;
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8(), &parseError);
+//    if (parseError.error != QJsonParseError::NoError) {
+//        qWarning() << "JSON Parse Error:" << parseError.errorString();
+//        return;
+//    }
+
+//    QJsonObject obj = doc.object();
+//    int timeInterval = obj["timeInterval"].toInt(-1);
+//    QString pathDirectory = obj["pathDirectory"].toString();
+
+//    if (timeInterval <= 0 || pathDirectory.isEmpty()) {
+//        qWarning() << "Invalid timeInterval or pathDirectory in JSON!";
+//        return;
+//    }
+
+//    const QString cfgfile = FILESETTING;
+//    const QString cfgfileINIT = FILESETTINGPATH;
+
+
+//    QFile file(cfgfile);
+//    if (!file.exists()) {
+//        qWarning() << "Configuration file does not exist:" << cfgfile;
+//        return;
+//    }
+//    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//        qWarning() << "Failed to open config file for reading.";
+//        return;
+//    }
+//    QTextStream in(&file);
+//    QStringList lines;
+//    while (!in.atEnd()) {
+//        QString line = in.readLine();
+
+//        if (line.trimmed().startsWith("record_interval=")) {
+//            line = QString("record_interval=%1").arg(timeInterval);
+//        } else if (line.trimmed().startsWith("record_directory=")) {
+//            line = QString("record_directory=%1").arg(pathDirectory);
+//        }
+
+//        lines << line;
+//    }
+//    file.close();
+
+//    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+//        qWarning() << "Failed to open config file for writing.";
+//        return;
+//    }
+
+//    QTextStream out(&file);
+//    for (const QString &line : lines) {
+//        out << line << '\n';
+//    }
+
+//    file.close();
+//    qDebug() << "Configuration file updated successfully.";
+
+
+
+//    QFile file2(cfgfileINIT);
+//    if (!file2.exists()) {
+//        qWarning() << "Configuration file does not exist:" << cfgfileINIT;
+//        return;
+//    }
+//    if (!file2.open(QIODevice::ReadOnly | QIODevice::Text)) {
+//        qWarning() << "Failed to open config file for reading.";
+//        return;
+//    }
+
+//    QTextStream in2(&file2);
+//    QStringList lines2;
+//    while (!in2.atEnd()) {
+//        QString line2 = in2.readLine();
+
+//        if (line2.trimmed().startsWith("record_interval=")) {
+//            line2 = QString("record_interval=%1").arg(timeInterval);
+//        } else if (line2.trimmed().startsWith("record_directory=")) {
+//            line2 = QString("record_directory=%1").arg(pathDirectory);
+//        }
+
+//        lines << line2;
+//    }
+//    file.close();
+
+//    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+//        qWarning() << "Failed to open config file for writing.";
+//        return;
+//    }
+
+//    QTextStream out2(&file2);
+//    for (const QString &line2 : lines2) {
+//        out2 << line2 << '\n';
+//    }
+//    file2.close();
+//    qDebug() << "Configuration file updated successfully.";
+//}
 
 
 void mainwindows::mesgManagement(QString mesg){
@@ -847,21 +1238,13 @@ void mainwindows::mesgManagement(QString mesg){
     }
 }
 
-
-void mainwindows::displayThread()
-{
-    qDebug() << "*********************************************************** displayThread start ********************************************************" ;
-    phyNetwork _eth0;
-    phyNetwork _eth1;
-    int blinkCount = 0;
-    QString _Reference;
-    QString line2String1 = "Used/All";
-    QString line2String2 = "Used/All";
-}
-
 void mainwindows::updateNewVolumeRecord(QString mesg) {
     qDebug() << "Received update:" << mesg;
+    QJsonDocument d = QJsonDocument::fromJson(mesg.toUtf8());
+    QJsonObject command = d.object();
+    QString getCommand =  QJsonValue(command["objectName"]).toString().trimmed();
     QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+
     if (!doc.isObject()) {
         qWarning() << "Invalid JSON data!";
         return;
@@ -870,7 +1253,8 @@ void mainwindows::updateNewVolumeRecord(QString mesg) {
     QJsonObject obj = doc.object();
     int volume = obj["currentVolume"].toInt();
     int level = obj["level"].toInt();
-
+    currentVolume = volume;
+    updatelevel = level;
     QString volString;
 
     switch (level) {
@@ -896,8 +1280,11 @@ void mainwindows::rotary(int encoderNum, int val, int InputEventID)
 
     if (val == -1) {
         if (currentVolume > 0) currentVolume--;
+        qWarning() << "currentVolume--:" << currentVolume;
+
     } else if (val == 1) {
         if (currentVolume < 0x3F) currentVolume++;
+        qWarning() << "currentVolume++:" << currentVolume;
     }
 
     if (!max9850->setVolume(currentVolume)) {
@@ -915,58 +1302,58 @@ void mainwindows::rotary(int encoderNum, int val, int InputEventID)
         QString maxVol = Volume+"max";
         displayInfo->setTextLine4_1(maxVol);
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x05 &&currentVolume <= 0x0D){
         level = 1;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||||||||||||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x0D &&currentVolume <= 0x15){
         level = 2;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||||||||||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x15 &&currentVolume <= 0x1E){
         level = 3;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||||||||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x1E &&currentVolume <= 0x26){
         level = 4;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||||||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x26 &&currentVolume <= 0x2E){
         level = 5;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else if (currentVolume > 0x2E &&currentVolume <= 0x3E){
         level = 6;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ||");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
     else {
         level = 7;
         qDebug() << "Volume set level to:" << currentVolume << level;
         displayInfo->setTextLine4_1("Vol: ");
         displayInfo->writeOLEDRun();
-        mysql->recordVolume(currentVolume,level);
+        mydatabase->recordVolume(currentVolume,level);
     }
-
+//    max9850->setVolume(currentVolume);
 }
 
 
@@ -1022,13 +1409,294 @@ void mainwindows::handleRecordFiles(const QString &jsonData)
     }
 }
 
+void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+    QJsonObject obj = doc.object();
+
+    if (obj["menuID"].toString() == "startLiveStream") {
+        int sid = obj["sid"].toInt();
+        QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
+        QString outputPath = QString("/home/orinnx/liveStream/ch%1.m3u8").arg(sid);
+
+        // ✅ Ensure symlink exists (one-time check)
+        QString symlinkPath = "/var/www/html/audiofiles";
+        QString targetPath = "/home/orinnx/liveStream";
+        QFileInfo symlinkInfo(symlinkPath);
+        if (symlinkInfo.exists() || symlinkInfo.isSymLink()) {
+            QFile::remove(symlinkPath);
+            qDebug() << "[Symlink] Removed old symlink:" << symlinkPath;
+        }
+
+        QProcess lnProc;
+        lnProc.start("ln", QStringList() << "-s" << targetPath << symlinkPath);
+        lnProc.waitForFinished();
+        qDebug() << "[Symlink] Created:" << symlinkPath << "→" << targetPath;
+
+        // ✅ ffmpeg args
+        QStringList args;
+        args << "-i" << rtspUrl
+             << "-vn"
+             << "-acodec" << "aac"
+             << "-f" << "hls"
+             << "-hls_time" << "2"
+             << "-hls_list_size" << "3"
+             << "-hls_flags" << "delete_segments"
+             << outputPath;
+
+        QProcess *ffmpegProc = new QProcess(this);
+        ffmpegProc->setProcessChannelMode(QProcess::MergedChannels);
+        connect(ffmpegProc, &QProcess::readyReadStandardOutput, [=]() {
+            qDebug() << "[ffmpeg output]" << ffmpegProc->readAllStandardOutput();
+        });
+
+        ffmpegProc->start("ffmpeg", args);
+        qDebug() << "[FFmpeg] Streaming sid:" << sid << "from" << rtspUrl << "to:" << outputPath;
+
+        // ✅ รอจนไฟล์ .m3u8 ถูกสร้าง
+        QFileInfo checkFile(outputPath);
+        int waitMs = 0;
+        while (!checkFile.exists() && waitMs < 3000) {
+            QThread::msleep(200);
+            waitMs += 200;
+            checkFile.refresh();
+        }
+
+        if (checkFile.exists()) {
+            QJsonObject reply;
+            reply["menuID"] = "streamStarted";
+            reply["sid"] = sid;
+            wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+        } else {
+            qWarning() << "❌ Failed to generate .m3u8 file in time.";
+        }
+    }
+}
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QByteArray br = mesg.toUtf8();
+//    QJsonDocument doc = QJsonDocument::fromJson(br);
+//    QJsonObject obj = doc.object();
+//    QJsonObject command = doc.object();
+//    QString getCommand =  QJsonValue(obj["objectName"]).toString();
+//    if (obj["menuID"].toString() == "startLiveStream") {
+//        int sid = obj["sid"].toInt();
+//        // QString ip = obj["ip"].toString(); // ❌ ไม่ต้องใช้ ip ของอุปกรณ์
+
+//        // ✅ เปลี่ยนมาใช้ localhost หรือ IP ของเครื่องที่มี RTSP stream อยู่
+//        QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
+//        QString outputPath = QString("/var/www/html/live/ch%1.m3u8").arg(sid);
+
+//        QStringList args;
+//        args << "-i" << rtspUrl
+//             << "-vn"
+//             << "-acodec" << "aac"
+//             << "-f" << "hls"
+//             << "-hls_time" << "2"
+//             << "-hls_list_size" << "3"
+//             << "-hls_flags" << "delete_segments"
+//             << outputPath;
+
+//        QProcess *ffmpegProcess = new QProcess(this);
+//        ffmpegProcess->start("ffmpeg", args);
+
+//        qDebug() << "[FFmpeg] Start stream for ch" << sid << "from:" << rtspUrl;
+//    }
+
+
+//}
+
+void mainwindows::updateSystem(QString message) {
+    qDebug() << "message:" << message;
+    QJsonDocument d = QJsonDocument::fromJson(message.toUtf8());
+    QJsonObject command = d.object();
+    QString getCommand =  QJsonValue(command["objectName"]).toString();
+//    QString lastFirmWare = command["text"].toString();
+//    QString lastFirmWareupdate = command["text"].toString();
+    QString lastFirmWare = command["swversion"].toString();
+    QString lastFirmWareupdate = command["swversion"].toString();
+
+    QString link = command["link"].toString();
+    qDebug() << "lastFirmWare for download" << lastFirmWare << "currentFirmWare running" << SwVersion << link;
+    if (((SwVersion.split(" ").size() >= 2) & (lastFirmWare.split(" ").size() >= 2)) == false)
+    {
+        if (SwVersion != lastFirmWare)
+        {
+            qDebug() << "(lastFirmWare != currentFirmWare)" << "lastFirmWare for download" << lastFirmWare << "currentFirmWare running" << SwVersion;
+            SwVersion=lastFirmWareupdate;
+
+            downloader->downloadFile(link, "/var/www/html/uploads/update.tar");
+        }
+    }
+    else if (SwVersion != lastFirmWare)
+    {
+        double currentVersion =  QString(SwVersion.split(" ").at(1)).toDouble();
+        double lastVersion = QString(lastFirmWare.split(" ").at(1)).toDouble();
+        QString currentFirmWare = SwVersion.split(" ").at(0);
+        lastFirmWare = lastFirmWare.split(" ").at(0);
+        qDebug() << "update lastFirmWare for download" << lastVersion << lastFirmWare << "currentFirmWare running" << currentVersion << currentFirmWare;
+        if (lastVersion > currentVersion)
+        {
+            qDebug() << "(lastFirmWare != currentFirmWare)" << "lastFirmWare for download" << lastVersion << lastFirmWare << "currentFirmWare running" << currentVersion << currentFirmWare;
+            SwVersion=lastFirmWareupdate;
+            qDebug() << "SwVersion:" << SwVersion;
+            downloader->downloadFile(link, "/var/www/html/uploads/update.tar");
+
+        }
+    }
+}
+
+void mainwindows::downloadCompleted(const QString &outputPath)
+{
+    qDebug() << "downloadCompleted:" << outputPath;
+
+    if (outputPath.contains("update.tar"))
+    {
+        updateFirmware();
+    }
+}
+
+void mainwindows::updateFirmware()
+{
+    system("sync");
+    qDebug() << "Start updateFirmware";
+    foundfileupdate = true;
+    QStringList fileupdate;
+    fileupdate = findFile();
+    system("sudo mkdir -p /tmp/update");
+
+    if (fileupdate.size() > 0) {
+        qDebug() << "Start update";
+        QString commandCopyFile = "cp " + QString(fileupdate.at(0)) + " /tmp/update/update.tar";
+        qDebug() << "commandCopyFile:" << commandCopyFile;
+        system(commandCopyFile.toStdString().c_str());
+        system("tar -xf /tmp/update/update.tar -C /tmp/update/");
+        system("cp $(find /tmp/update -name 'README.txt' | head -n1) /home/orinnx/README.txt");
+        qDebug() << "Before update complete";
+        system("sh /tmp/update/update.sh");
+        qDebug() << "Update script done";
+        system("rm -rf /tmp/update");
+        qDebug() << "Update complete";
+        system("sudo systemctl restart iRecord.service");
+        system("sync");
+        qDebug() << "Exiting now";
+        exit(0);
+    }
+
+    foundfileupdate = false;
+}
+
+//void mainwindows::updateFirmware()
+//{
+//    system("sync");
+//    qDebug() << "Start updateFirmware";
+//    foundfileupdate = true;
+//    QStringList fileupdate;
+//    fileupdate = findFile();
+//    system("sudo mkdir -p /tmp/update");
+//    if (fileupdate.size() > 0){
+////        updateScreenOnOff(true);
+//        qDebug() << "Start update";
+//        QString commandCopyFile = "cp " + QString(fileupdate.at(0)) + " /tmp/update/update.tar";
+//        qDebug() << "commandCopyFile:" << commandCopyFile;
+//        system(commandCopyFile.toStdString().c_str());
+//        system("tar -xf /tmp/update/update.tar -C /tmp/update/");
+////        system("sudo cp /home/pi/update.sh /tmp/update/");
+//        system("sh /tmp/update/update.sh");
+//        system("rm -rf /tmp/update");
+////        system("rm -rf /usr/share/apache2/default-site/htdocs/uploads/*");
+//        qDebug() << "Update complete";
+//        system("sync");
+//        exit(0);
+//    }
+//    foundfileupdate = false;
+//}
+
+
+QStringList mainwindows::findFile()
+{
+    QStringList listfilename;
+    QString ss="/var/www/html/uploads/";
+    const char *sss ;
+    sss = ss.toStdString().c_str();
+    QDir dir1("/var/www/html/uploads/");
+    QString filepath;
+    QString filename;
+    QFileInfoList fi1List( dir1.entryInfoList( QDir::Files, QDir::Name) );
+    foreach( const QFileInfo & fi1, fi1List ) {
+        filepath = QString::fromUtf8(fi1.absoluteFilePath().toLocal8Bit());
+        filename = QString::fromUtf8(fi1.fileName().toLocal8Bit());
+        listfilename << filepath;
+        qDebug() << filepath;// << filepath.toUtf8().toHex();
+    }
+    return listfilename;
+}
+
+
+void mainwindows::playWavFile(const QString& filePath) {
+    qDebug() << "Playing WAV file:" << filePath;
+
+    QString safePath = QDir::cleanPath(filePath);
+
+    QString cmd = QString("ffplay -nodisp -autoexit -loglevel quiet '%1' &").arg(safePath);
+    qDebug() << "Command:" << cmd;
+
+    int result = system(cmd.toUtf8().constData());
+    if (result != 0) {
+        qWarning() << "Failed to execute ffplay command!";
+    }
+}
+
+
+void mainwindows::formatExternal(const QString &filePath) {
+    qDebug() << "formatExternal called with:" << filePath;
+    QByteArray br = filePath.toUtf8();
+    QJsonDocument doc = QJsonDocument::fromJson(br);
+    QJsonObject obj = doc.object();
+    QJsonObject command = doc.object();
+    QString getfilePath =  QJsonValue(obj["storage"]).toString();
+
+    QString getfilePath1 =  QJsonValue(obj["external1"]).toString();
+    QString getfilePath2 =  QJsonValue(obj["external2"]).toString();
+
+    QString targetDevice;
+    QString partition;
+    QString mountPath;
+
+    if (getfilePath == "external1") {
+        targetDevice = "/dev/nvme1n1";
+        partition = "/dev/nvme1n1p1";
+        mountPath = "/media/SSD1";
+        qDebug() << "external1:" << filePath ;
+
+    } else if (getfilePath == "external2") {
+        targetDevice = "/dev/nvme2n1";
+        partition = "/dev/nvme2n1p1";
+        mountPath = "/media/SSD2";
+        qDebug() << "external2:" << filePath ;
+
+    } else {
+        qWarning() << "Invalid filePath argument:" << filePath;
+        return;
+    }
+
+    QDir().mkpath(mountPath);
+    QProcess::execute("umount", QStringList() << mountPath);
+    QProcess::execute("wipefs", QStringList() << "-a" << targetDevice);
+    QProcess::execute("parted", QStringList() << "-s" << targetDevice << "mklabel" << "gpt");
+    QProcess::execute("parted", QStringList() << "-s" << targetDevice << "mkpart" << "primary" << "ext4" << "0%" << "100%");
+    QProcess::execute("mkfs.ext4", QStringList() << "-F" << partition);
+    QProcess::execute("mount", QStringList() << partition << mountPath);
+
+    qDebug() << "Successfully formatted and mounted" << partition << "to" << mountPath;
+}
+
 
 void* mainwindows::ThreadFunc(void* pTr)
 {
     mainwindows* pThis = static_cast<mainwindows*>(pTr);
     while (true) {
-        emit pThis->requestUpdateDateTime();
-        QThread::sleep(1);
+        emit pThis->getDateTime();
+        QThread::msleep(500);
     }
     return nullptr;
 }
@@ -1038,20 +1706,57 @@ void* mainwindows::ThreadFunc2(void* pTr )
     mainwindows* pThis = static_cast<mainwindows*>(pTr);
     while (true) {
         pThis->readSSDStorage();
+        QThread::msleep(1000);
     }
     return NULL;
 }
 
-void* mainwindows::ThreadFunc3(void* pTr )
+void* mainwindows::ThreadFunc3(void* pTr)
 {
     mainwindows* pThis = static_cast<mainwindows*>(pTr);
     while (true) {
         pThis->max31760->tempDetect();
+        QThread::msleep(1000);
     }
     return NULL;
 }
+void mainwindows::runBuildAndRestartServices() {
+    QString workDir = "/home/orinnx/alphatest/irecd1.0.4/src/";
 
-//    system("speaker-test -D hw:3,1 -r 8000 -c 2 -t sine -f 1000");
+    // Step 1: make build
+    QProcess build;
+    build.setWorkingDirectory(workDir);
+    build.start("make", QStringList() << "build");
+    if (!build.waitForFinished() || build.exitCode() != 0) {
+        qWarning() << "make build failed:" << build.readAllStandardError();
+        return;
+    }
+    qDebug() << "make build completed.";
+
+    // Step 2: make install
+    QProcess install;
+    install.setWorkingDirectory(workDir);
+    install.start("make", QStringList() << "install");
+    if (!install.waitForFinished() || install.exitCode() != 0) {
+        qWarning() << "make install failed:" << install.readAllStandardError();
+        return;
+    }
+    qDebug() << "make install completed.";
+
+    // Step 3: restart services
+    QProcess restart;
+    QString command = "sudo systemctl restart irecd.service iplayd.service";
+    restart.start("bash", QStringList() << "-c" << command);
+    if (!restart.waitForFinished() || restart.exitCode() != 0) {
+        qWarning() << "Failed to restart services:" << restart.readAllStandardError();
+        return;
+    }
+
+    qDebug() << "Services restarted successfully.";
+}
+
+
+//    system("speaker-test -D hw:3,1 -r 8000  -c 2 -t sine -f 1000");
 //    system("echo PE.06 > /sys/class/gpio/export");
 //    QThread::msleep(100);
 //    system("echo out > /sys/class/gpio/PE.06/direction");

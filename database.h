@@ -54,6 +54,16 @@ public slots:
     void RemoveFile(const QString& jsonString, QWebSocket* wClient);
     void getRegisterDevicePage(const QString& jsonString, QWebSocket* wClient);
     void removeRegisterDevice(const QString& jsonString, QWebSocket* wClient);
+    void recordChannel(QString, QWebSocket*);
+    void selectRecordChannel(QString,QWebSocket* wClient);
+    void CheckandVerifyDatabases();
+    void CheckandVerifyTable();
+    void verifyTableSchema(const QString &tableName, const QMap<QString, QString> &expectedColumns);
+//    void selectRecordChannel(QString, QString, int, QString, QString, QWebSocket* wClient);
+    bool tableExists(const QString &tableName);
+    void cleanupOldRecordFiles();
+    void maybeRunCleanup();
+    void updatePath(const QString& jsonString, QWebSocket* wClient);
 
 private:
     void addMissingColumn(const QString &tableName, const QString &columnName, const QString &columnType);  // ✅ เพิ่มบรรทัดนี้

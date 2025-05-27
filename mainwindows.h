@@ -38,7 +38,11 @@
 #include <grp.h>
 #include <unistd.h>
 #include <sys/stat.h>
-
+#include "FileDownloader.h"
+#include <QFile>
+#include <QTextStream>
+#include <QRegularExpression>
+#include <QRegularExpressionMatch>
 #define CODECMAX9850  "7"
 #define CODECI2CADDR   0x10
 #define GPIO01	"PQ.05"     //"453"		//GPIO33_PQ.05		tegra234-gpio = (15*8)+5 = 125
@@ -52,11 +56,13 @@
 
 #define CODEC_RESET_PIN GPIO13
 
-#define OLED2_DC         "1016" //[4]
-#define OLED2_RESET      "1017" //[5]
-#define OLED2_SPIDEV     "/dev/spidev2.0"
-#define FILESETTING    "/etc/ifzrecorder/config.conf"
-#define FILESETTINGIP  "/home/orinnx/recorder/may1/config.conf"
+#define OLED2_DC            "1016" //[4]
+#define OLED2_RESET         "1017" //[5]
+#define OLED2_SPIDEV        "/dev/spidev2.0"
+#define FILESETTING         "/etc/irecord.conf"              //"/etc/ifzrecorder/config.conf"
+#define FILESETTINGPATH     "/home/orinnx/alphatest/irecd1.0.4/src/config.ini"
+#define FILESETTINGIP       "/home/orinnx/recorder/may1/config.conf"
+#define FILESETTINGVERSION  "/home/orinnx/README.txt"
 
 class mainwindows: public QObject
 {
@@ -70,10 +76,9 @@ signals:
     void recordLevel(int,int);
     void mainwindowsMesg(QString, QWebSocket*);
     void updateNetwork(QString ,QString ,QString ,QString ,QString , QString);
-
+    void triggerRotary(int encoderNum, int val, int inputEventID);
 public slots:
 
-    void displayThread();
     void mesgManagement(QString);
     void getDateTime();
     void readSSDStorage();
@@ -90,8 +95,20 @@ public slots:
     void handleSelectPath(const QJsonObject &obj, QWebSocket* wClient);
     void configDestinationIP(QString, QWebSocket*);
     void updateCurrentPathDirectory(QString, QWebSocket*);
-
+    void liveSteamRecordRaido(QString, QWebSocket*);
+    void updateSystem(QString message);
+    void downloadCompleted(const QString &outputPath);
+    void updateFirmware();
+    QStringList findFile();
+//    void recordChannel(QString, QWebSocket*);
+    void playWavFile(const QString& filePath);
+    void formatExternal(const QString &filePath);
+    void runBuildAndRestartServices();
 private:
+    FileDownloader *downloader = nullptr;
+    QString SwVersion = "27052025 0.9"; //ในนี้จะต่ำกว่าในเว็บ 0.1 version
+    bool foundfileupdate = false;
+    int updateStatus = 0;
     Max9850 *max9850;
     GPIOClass *gpioAmp;
     infoDisplay *displayInfo;
@@ -119,6 +136,7 @@ private:
     QString display2line3;
     QString display2line4;
     QString newdisplay2line4;
+    QList<int> activeStreamIds;
     QString getDeviceFromMount(const QString& mountPath) {
         QString cmd = QString("findmnt -n -o SOURCE --target %1").arg(mountPath);
         FILE* pipe = popen(cmd.toUtf8().data(), "r");
@@ -146,6 +164,19 @@ private:
             qDebug() << mountPoint << "is not mounted. Trying to mount.";
             QProcess mnt;
             mnt.start("mount", {device, mountPoint});
+            mnt.waitForFinished();
+            return (mnt.exitCode() == 0);
+        }
+        return true;
+    }
+    bool unmountIfNotMounted(const QString& device, const QString& mountPoint) {
+        QProcess process;
+        process.start("umount", {"-q", mountPoint});
+        process.waitForFinished();
+        if (process.exitCode() != 0) {
+            qDebug() << mountPoint << "is not mounted. Trying to mount.";
+            QProcess mnt;
+            mnt.start("umount", {device, mountPoint});
             mnt.waitForFinished();
             return (mnt.exitCode() == 0);
         }
@@ -187,15 +218,19 @@ private:
     typedef void * (*THREADFUNCPTR2)(void *);
     static void* ThreadFunc3(void* pTr);
     typedef void * (*THREADFUNCPTR3)(void *);
+
     pthread_t idThread;
     pthread_t idThread2;
     pthread_t idThread3;
 
 
+
     unsigned char VolumeOut = 255;
-    int currentVolume = 0x3F;
+    int currentVolume;
+    int updatelevel;
+
     float CPUtemp, GPUtemp;
-    QDateTime currentDateTime;
+//    QDateTime currentDateTime;
     QString date, time;
     QString fileName, filePath;
     unsigned long total;
@@ -207,6 +242,7 @@ private:
     double ssdUsedGB = 0, ssdTotalGB = 0;
     double rootUsedGB = 0, rootTotalGB = 0;
     double extUsedGB = 0, extTotalGB = 0;
+
 
 };
 

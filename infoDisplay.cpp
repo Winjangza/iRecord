@@ -28,7 +28,7 @@ void infoDisplay::setTextLine3_1(QString text)
 }
 void infoDisplay::setTextLine3_2(QString text)
 {
-    setTextLine3(text.toStdString().c_str(),LINE3INDEX2);
+//    setTextLine3(text.toStdString().c_str(),LINE3INDEX2);
 }
 void infoDisplay::setTextLine4_1(QString text)
 {
@@ -36,7 +36,7 @@ void infoDisplay::setTextLine4_1(QString text)
 }
 void infoDisplay::setTextLine4_2(QString text)
 {
-    setTextLine4(text.toStdString().c_str(), LINE4INDEX2);
+//    setTextLine4(text.toStdString().c_str(), LINE4INDEX2);
 }
 
 void infoDisplay::setTextLine1(const char *text, int index)

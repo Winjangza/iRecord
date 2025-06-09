@@ -64,6 +64,12 @@ public slots:
     void cleanupOldRecordFiles();
     void maybeRunCleanup();
     void updatePath(const QString& jsonString, QWebSocket* wClient);
+//    void mysqlRecordDevice(const QJsonObject &obj);
+    void lookupDeviceStationByIp(const QString& megs, QWebSocket* wClient);
+    void recordToRecordChannel(const QJsonObject& obj);
+    void formatDatabases(QString);
+    void linkRecordChannelWithDeviceStation();
+    void linkRecordFilesWithDeviceStationOnce();
 
 private:
     void addMissingColumn(const QString &tableName, const QString &columnName, const QString &columnType);  // ✅ เพิ่มบรรทัดนี้

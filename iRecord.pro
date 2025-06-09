@@ -5,6 +5,7 @@ QT += gui
 QT += sql
 CONFIG += c++11 console
 CONFIG -= app_bundle
+QT += concurrent websockets
 
 # You can make your code fail to compile if it uses deprecated APIs.
 # In order to do so, uncomment the following line.
@@ -22,6 +23,7 @@ SOURCES += \
         SPI.cpp \
         SPIOLED.cpp \
         SocketClient.cpp \
+        Unixsocketlistener.cpp \
         database.cpp \
         infoDisplay.cpp \
         linux_spi.cpp \
@@ -45,6 +47,7 @@ HEADERS += \
     SPI.h \
     SPIOLED.h \
     SocketClient.h \
+    Unixsocketlistener.h \
     database.h \
     font16.h \
     infoDisplay.h \

@@ -46,6 +46,194 @@ bool restartMySQLService() {
     }
 }
 
+void Database::lookupDeviceStationByIp(const QString& megs, QWebSocket* wClient) {
+    qDebug() << "lookupDeviceStationByIp:" << megs;
+
+    if (!db.isOpen()) {
+        qDebug() << "Opening database...";
+        if (!db.open()) {
+            qWarning() << "Failed to open database:" << db.lastError().text();
+            return;
+        }
+    }
+
+    QStringList parts = megs.split(",");
+    if (parts.size() != 4) {
+        qWarning() << "Invalid message format";
+        return;
+    }
+
+    QString ip     = parts[0].trimmed();
+    QString freq   = parts[1].trimmed();
+    QString url    = parts[2].trimmed();
+    QString action = parts[3].trimmed();
+
+    QSqlQuery query(db);  // ใช้ db ตัวหลัก
+    query.prepare("SELECT id, name FROM device_station WHERE ip = :ip LIMIT 1");
+    query.bindValue(":ip", ip);
+
+    if (query.exec()) {
+        if (query.next()) {
+            int sid = query.value("id").toInt();
+            QString name = query.value("name").toString();
+
+            QJsonObject obj;
+            obj["ip"] = ip;
+            obj["freq"] = freq;
+            obj["url"] = url;
+            obj["action"] = action;
+            obj["sid"] = sid;
+            obj["name"] = name;
+
+            qDebug() << "Device found:" << obj;
+            QThread::msleep(100);
+            recordToRecordChannel(obj);
+        } else {
+            qWarning() << "Device not found for IP:" << ip;
+        }
+    } else {
+        qWarning() << "Failed to execute query:" << query.lastError().text();
+    }
+//    db.close();
+}
+
+void Database::formatDatabases(QString megs) {
+    qDebug() << "Received format command:" << megs;
+    QByteArray br = megs.toUtf8();
+    QJsonDocument doc = QJsonDocument::fromJson(br);
+    QJsonObject obj = doc.object();
+    QJsonObject command = doc.object();
+    QString menuID = obj["menuID"].toString().trimmed();
+
+    if (menuID == "formatExternal") {
+        qDebug() << "formatDatabases:" << megs;
+        qDebug() << "Database path:" << db.databaseName();
+
+        if (!db.isOpen()) {
+            if (!db.open()) {
+                qDebug() << "❌ Failed to open database:" << db.lastError().text();
+                return;
+            }
+        }
+
+        QSqlQuery pragmaQuery(db);
+        pragmaQuery.exec("PRAGMA foreign_keys = OFF;"); // for SQLite
+
+        QSqlQuery query(db);
+        QString cmd = "DELETE FROM record_files WHERE 1=1;";
+        if (!query.exec(cmd)) {
+            qDebug() << "❌ Failed to clear record_files table:" << query.lastError().text();
+        } else {
+            qDebug() << "✅ Cleared table record_files successfully.";
+        }
+
+        // ตรวจสอบว่าลบหมดจริงหรือไม่
+        QSqlQuery countQuery("SELECT COUNT(*) FROM record_files;", db);
+        if (countQuery.next()) {
+            int remaining = countQuery.value(0).toInt();
+            qDebug() << "Remaining rows in record_files:" << remaining;
+        }
+
+        db.close();
+    }
+}
+
+
+void Database::recordToRecordChannel(const QJsonObject& obj) {
+    QString ip      = obj.value("ip").toString().trimmed();
+    QString url     = obj.value("url").toString().trimmed();
+    QString action  = obj.value("action").toString().trimmed();
+    QString name    = obj.value("name").toString().trimmed();
+    int sid         = obj.value("sid").toInt(-1);
+    int freq        = 0;
+
+    if (obj.contains("freq")) {
+        if (obj["freq"].isString())
+            freq = obj["freq"].toString().toInt();
+        else if (obj["freq"].isDouble())
+            freq = obj["freq"].toInt();
+    }
+
+    if (sid < 0) {
+        qWarning() << "Invalid SID, aborting.";
+        return;
+    }
+
+    if (!db.isValid() || !db.isOpen()) {
+        if (!db.open()) {
+            qWarning() << "Failed to open database:" << db.lastError().text();
+            return;
+        }
+    }
+
+    const QString now = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+
+    QSqlQuery queryCheck(db);
+    queryCheck.prepare("SELECT id, sid, ip, url, name, freq FROM record_channel WHERE ip = :ip LIMIT 1");
+    queryCheck.bindValue(":ip", ip);
+
+
+    if (!queryCheck.exec()) {
+        qWarning() << "Failed to SELECT from record_channel:" << queryCheck.lastError().text();
+        return;
+    }
+
+    if (queryCheck.next()) {
+        int id = queryCheck.value("id").toInt();
+        QString ipDB   = queryCheck.value("ip").toString();
+        QString urlDB  = queryCheck.value("url").toString();
+        QString nameDB = queryCheck.value("name").toString();
+        int freqDB     = queryCheck.value("freq").toInt();
+
+        bool needsUpdate = (ipDB != ip || urlDB != url || nameDB != name || freqDB != freq);
+
+        if (needsUpdate) {
+            QSqlQuery updateQuery(db);
+            updateQuery.prepare(R"(
+                UPDATE record_channel
+                SET ip = :ip, url = :url, name = :name, freq = :freq,
+                    action = :action, updated_at = :updated
+                WHERE id = :id
+            )");
+            updateQuery.bindValue(":ip", ip);
+            updateQuery.bindValue(":url", url);
+            updateQuery.bindValue(":name", name);
+            updateQuery.bindValue(":freq", freq);
+            updateQuery.bindValue(":action", action);
+            updateQuery.bindValue(":updated", now);
+            updateQuery.bindValue(":id", id);
+
+            if (!updateQuery.exec()) {
+                qWarning() << "Failed to update record_channel:" << updateQuery.lastError().text();
+            } else {
+                qDebug() << "Updated record_channel with SID:" << sid;
+            }
+        } else {
+            qDebug() << "No update needed for SID:" << sid;
+        }
+    } else {
+        QSqlQuery insertQuery(db);
+        insertQuery.prepare(R"(
+            INSERT INTO record_channel (sid, ip, url, action, name, freq, created_at, updated_at)
+            VALUES (:sid, :ip, :url, :action, :name, :freq, :created, :updated)
+        )");
+        insertQuery.bindValue(":sid", sid);
+        insertQuery.bindValue(":ip", ip);
+        insertQuery.bindValue(":url", url);
+        insertQuery.bindValue(":action", action);
+        insertQuery.bindValue(":name", name);
+        insertQuery.bindValue(":freq", freq);
+        insertQuery.bindValue(":created", now);
+        insertQuery.bindValue(":updated", now);
+
+        if (!insertQuery.exec()) {
+            qWarning() << "Failed to insert into record_channel:" << insertQuery.lastError().text();
+        } else {
+            qDebug() << "Inserted new record_channel with SID:" << sid;
+        }
+    }
+}
+
 
 bool Database::tableExists(const QString &tableName) {
     QSqlQuery query;
@@ -102,11 +290,14 @@ void Database::CheckandVerifyDatabases() {
                 uri VARCHAR(255),
                 freq DECIMAL(10,0),
                 ambient TINYINT(1) DEFAULT 0,
-                group INT UNSIGNED,
+                `group` INT UNSIGNED,
                 visible TINYINT(1) DEFAULT 0,
-                last_access DATETIME
+                last_access DATETIME,
+                chunk INT DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             )
         )" },
+
         { "devices", R"(
             CREATE TABLE devices (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -122,13 +313,14 @@ void Database::CheckandVerifyDatabases() {
         { "record_channel", R"(
             CREATE TABLE record_channel (
                 id SMALLINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                record VARCHAR(255),
-                conn INT,
+                action VARCHAR(255),
                 ip VARCHAR(45),
                 url VARCHAR(255),
                 freq VARCHAR(50),
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                sid INT,
+                name VARCHAR(255)
             )
         )" },
         { "record_files", R"(
@@ -136,8 +328,10 @@ void Database::CheckandVerifyDatabases() {
                 id BINARY(16) PRIMARY KEY,
                 device INT UNSIGNED,
                 filename VARCHAR(255),
+                file_path VARCHAR(255),
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                continuous_count INT
+                continuous_count INT,
+                name VARCHAR(255)
             )
         )" },
         { "volume_log", R"(
@@ -166,6 +360,104 @@ void Database::CheckandVerifyDatabases() {
     }
     CheckandVerifyTable();
 }
+
+
+void Database::linkRecordChannelWithDeviceStation() {
+    if (!db.isOpen() && !db.open()) {
+        qDebug() << "❌ Cannot open database:" << db.lastError().text();
+        return;
+    }
+
+    QSqlQuery selectQuery(db);
+    QSqlQuery updateQuery(db);
+
+    QString selectStr = R"(
+        SELECT rc.id, ds.name, ds.id AS ds_id
+        FROM record_channel rc
+        JOIN device_station ds
+          ON rc.ip COLLATE utf8mb4_general_ci = ds.ip COLLATE utf8mb4_general_ci
+        WHERE (rc.name IS NULL OR rc.name = '')
+           OR (rc.sid IS NULL OR rc.sid = 0)
+    )";
+
+    if (!selectQuery.exec(selectStr)) {
+        qDebug() << "❌ Failed to select unmatched fields:" << selectQuery.lastError().text();
+        return;
+    }
+
+    while (selectQuery.next()) {
+        int rc_id = selectQuery.value("id").toInt();
+        QString ds_name = selectQuery.value("name").toString();
+        int ds_id = selectQuery.value("ds_id").toInt();
+
+        QString updateStr = R"(
+            UPDATE record_channel
+            SET name = :name, sid = :sid
+            WHERE id = :id
+        )";
+
+        updateQuery.prepare(updateStr);
+        updateQuery.bindValue(":name", ds_name);
+        updateQuery.bindValue(":sid", ds_id);
+        updateQuery.bindValue(":id", rc_id);
+
+        if (!updateQuery.exec()) {
+            qDebug() << "❌ Failed to update record_channel.id =" << rc_id << ":" << updateQuery.lastError().text();
+        } else {
+            qDebug() << "✅ Linked record_channel.id =" << rc_id << " with name =" << ds_name << " and sid =" << ds_id;
+        }
+    }
+
+    db.close();
+}
+
+
+void Database::linkRecordFilesWithDeviceStationOnce() {
+    if (!db.isOpen() && !db.open()) {
+        qDebug() << "❌ Cannot open database:" << db.lastError().text();
+        return;
+    }
+
+    QSqlQuery checkQuery(db);
+    QString checkStr = R"(
+        SELECT rf.id
+        FROM record_files rf
+        LEFT JOIN device_station ds ON rf.device = ds.id
+        WHERE rf.file_path IS NULL OR rf.file_path = ''
+           OR rf.name IS NULL OR rf.name = ''
+        LIMIT 1
+    )";
+
+    if (!checkQuery.exec(checkStr)) {
+        qDebug() << "❌ Failed to check record_files:" << checkQuery.lastError().text();
+        return;
+    }
+
+    if (!checkQuery.next()) {
+        qDebug() << "✅ All record_files already linked. Nothing to do.";
+        return;  // ทุกแถวมีข้อมูลครบแล้ว
+    }
+
+    QSqlQuery updateQuery(db);
+    QString updateStr = R"(
+        UPDATE record_files rf
+        JOIN device_station ds ON rf.device = ds.id
+        SET rf.file_path = ds.storage_path,
+            rf.name = ds.name
+        WHERE rf.file_path IS NULL OR rf.file_path = ''
+           OR rf.name IS NULL OR rf.name = ''
+    )";
+
+    if (!updateQuery.exec(updateStr)) {
+        qDebug() << "❌ Failed to update record_files:" << updateQuery.lastError().text();
+    } else {
+        qDebug() << "✅ Linked missing record_files with device_station successfully.";
+    }
+
+    db.close();
+}
+
+
 
 void Database::CheckandVerifyTable() {
     qDebug() << "CheckandVerifyTable started";
@@ -196,8 +488,10 @@ void Database::CheckandVerifyTable() {
                 { "id", "BINARY(16) PRIMARY KEY" },
                 { "device", "INT UNSIGNED" },
                 { "filename", "VARCHAR(255)" },
+                { "file_path", "VARCHAR(255)" },
                 { "created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP" },
-                { "continuous_count", "INT" }
+                { "continuous_count", "INT" },
+                { "name", "VARCHAR(255)" }
             }
         },
         {
@@ -214,25 +508,29 @@ void Database::CheckandVerifyTable() {
                 { "payload_size", "INT" },
                 { "terminal_type", "INT" },
                 { "name", "VARCHAR(255)" },
-                { "ip", "INT" },
+                { "ip", "VARCHAR(255)" },
                 { "uri", "VARCHAR(255)" },
                 { "freq", "DECIMAL(10,0)" },
                 { "ambient", "TINYINT(1) DEFAULT 0" },
                 { "group", "INT UNSIGNED" },
                 { "visible", "TINYINT(1) DEFAULT 0" },
-                { "last_access", "DATETIME" }
+                { "last_access", "DATETIME" },
+                { "chunk", "INT DEFAULT 0" },
+                { "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" }
             }
+
         },
         {
             "record_channel", {
                 { "id", "INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY" },
-                { "record", "VARCHAR(255)" },
-                { "conn", "INT" },
+                { "action", "VARCHAR(255)" },
                 { "ip", "VARCHAR(45)" },
                 { "url", "VARCHAR(255)" },
-                { "freq", "VARCHAR(50)" },
+                { "freq", "VARCHAR(50)" },                
                 { "created_at", "DATETIME DEFAULT CURRENT_TIMESTAMP" },
-                { "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" }
+                { "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" },
+                { "sid", "INT" },
+                { "name", "VARCHAR(255)" }
             }
         },
         {
@@ -346,10 +644,10 @@ void Database::maybeRunCleanup() {
 
     if (query.next()) {
         QDateTime minDate = query.value(0).toDateTime();
-        if (minDate.daysTo(QDateTime::currentDateTime()) >= 30) {
+        if (minDate.daysTo(QDateTime::currentDateTime()) >= 7) {
             cleanupOldRecordFiles();
         } else {
-            qDebug() << "No cleanup needed. Oldest date is within 30 days.";
+            qDebug() << "No cleanup needed. Oldest date is within 7 days.";
         }
     }
 }
@@ -372,14 +670,20 @@ void Database::CheckAndHandleDevice(const QString& jsonString, QWebSocket* wClie
     QString inputIp = obj["ip"].toString();
     QString inputUri = obj["uri"].toString();
     int inputFreq = obj["freq"].toInt();
-    QString inputAmbient = obj.contains("ambient") && !obj["ambient"].isNull() ? obj["ambient"].toString() : "NULL";
+    QVariant inputAmbient = obj.contains("ambient") && !obj["ambient"].isNull() ? obj["ambient"].toInt() : QVariant();
     int inputGroup = obj["group"].toInt();
     int inputVisible = obj["visible"].toInt();
-    QString inputLastAccess = obj.contains("last_access") && !obj["last_access"].isNull() ? obj["last_access"].toString() : "NULL";
+    QVariant inputLastAccess = obj.contains("last_access") && !obj["last_access"].isNull() ? obj["last_access"].toString() : QVariant();
+    int inputChunk = obj["chunk"].toInt();
+    QString inputupdated_at = obj["chunk"].toString();
 
     QSqlQuery query;
-    query.prepare("SELECT sid, payload_size, terminal_type, name, ip, uri, freq, ambient, `group`, visible, last_access "
-                  "FROM device_station WHERE sid = :sid");
+    query.prepare(R"(
+        SELECT id, sid, payload_size, terminal_type, name, ip, uri, freq,
+               ambient, `group`, visible, last_access, storage_path, chunk, updated_at
+        FROM device_station
+        WHERE sid = :sid
+    )");
     query.bindValue(":sid", inputSid);
 
     if (!query.exec()) {
@@ -403,6 +707,9 @@ void Database::CheckAndHandleDevice(const QString& jsonString, QWebSocket* wClie
         int dbGroup = query.value("group").toInt();
         int dbVisible = query.value("visible").toInt();
         QString dbLastAccess = query.value("last_access").isNull() ? "NULL" : query.value("last_access").toString();
+        QString dbStoragePath = query.value("storage_path").toString();
+        int dbChunk = query.value("chunk").toInt();
+        QVariant dbUpdatedAt = query.value("updated_at").isNull() ? QVariant() : query.value("updated_at");
 
         if (
             inputPayloadSize != dbPayload ||
@@ -414,7 +721,10 @@ void Database::CheckAndHandleDevice(const QString& jsonString, QWebSocket* wClie
             inputAmbient != dbAmbient ||
             inputGroup != dbGroup ||
             inputVisible != dbVisible ||
-            inputLastAccess != dbLastAccess
+            inputLastAccess != dbLastAccess ||
+            inputChunk != dbChunk ||
+            inputupdated_at != dbChunk
+
         ) {
             qDebug() << "Data mismatch detected. Updating device_station.";
             UpdateDeviceInDatabase(jsonString, wClient);
@@ -631,13 +941,13 @@ void Database::selectRecordChannel(QString jsonString, QWebSocket* wClient) {
     while (query.next()) {
         QJsonObject record;
         record["id"] = query.value("id").toInt();
-        record["record"] = query.value("record").toString();
-        record["conn"] = query.value("conn").toInt();
+        record["action"] = query.value("action").toString();
         record["ip"] = query.value("ip").toString();
         record["url"] = query.value("url").toString();
         record["freq"] = query.value("freq").toString();
         record["created_at"] = query.value("created_at").toString();
         record["updated_at"] = query.value("updated_at").toString();
+        record["name"] = query.value("name").toString();
         record["sid"] = query.value("sid").toInt();
         records.append(record);
     }
@@ -857,7 +1167,9 @@ void Database::UpdateDeviceInDatabase(const QString& jsonString, QWebSocket* wCl
             `group` = :groupVal,
             visible = :visible,
             last_access = :last_access,
-            name = :name
+            name = :name,
+            chunk = :chunk,
+            updated_at = :updated_at
         WHERE sid = :sid
     )");
 
@@ -871,7 +1183,10 @@ void Database::UpdateDeviceInDatabase(const QString& jsonString, QWebSocket* wCl
     updateQuery.bindValue(":visible", obj["visible"].toInt());
     updateQuery.bindValue(":last_access", obj.contains("last_access") && !obj["last_access"].isNull() ? obj["last_access"].toString() : QVariant());
     updateQuery.bindValue(":name", obj["name"].toString());
+    updateQuery.bindValue(":chunk", obj["chunk"].toInt());
     updateQuery.bindValue(":sid", obj["sid"].toInt());
+    updateQuery.bindValue(":updated_at", obj["updated_at"].toString());
+
 
 
     if (!updateQuery.exec()) {
@@ -900,7 +1215,12 @@ void Database::RegisterDeviceToDatabase(const QString& jsonString, QWebSocket* w
     QJsonObject obj = QJsonDocument::fromJson(jsonString.toUtf8()).object();
 
     QSqlQuery query;
-    query.prepare("INSERT INTO device_station (sid, payload_size, terminal_type, name, ip, uri, freq, ambient, `group`, visible, last_access) VALUES (:sid, :payload_size, :terminal_type, :name, :ip, :uri, :freq, :ambient, :groupVal, :visible, :last_access)");
+    query.prepare(R"(
+        INSERT INTO device_station
+        (sid, payload_size, terminal_type, name, ip, uri, freq, ambient, `group`, visible, last_access, chunk, updated_at)
+        VALUES
+        (:sid, :payload_size, :terminal_type, :name, :ip, :uri, :freq, :ambient, :groupVal, :visible, :last_access, :chunk, :updated_at)
+    )");
 
     query.bindValue(":sid", obj["sid"].toInt());
     query.bindValue(":payload_size", obj["payload_size"].toInt());
@@ -913,6 +1233,8 @@ void Database::RegisterDeviceToDatabase(const QString& jsonString, QWebSocket* w
     query.bindValue(":groupVal", obj["group"].toInt());
     query.bindValue(":visible", obj["visible"].toInt());
     query.bindValue(":last_access", obj.contains("last_access") && !obj["last_access"].isNull() ? obj["last_access"].toString() : QVariant());
+    query.bindValue(":chunk", obj.contains("chunk") && !obj["chunk"].isNull() ? obj["chunk"].toInt() : QVariant());
+    query.bindValue(":updated_at", obj.contains("updated_at") && !obj["updated_at"].isNull() ? obj["updated_at"].toString() : QVariant());
 
     if (!query.exec()) {
         qWarning() << "Insert failed:" << query.lastError().text();
@@ -922,6 +1244,8 @@ void Database::RegisterDeviceToDatabase(const QString& jsonString, QWebSocket* w
     db.close();
     getRegisterDevicePage(jsonString, wClient);
 }
+
+
 
 void Database::updatePath(const QString& jsonString, QWebSocket* wClient) {
     qDebug() << "updatePath received:" << jsonString;
@@ -946,17 +1270,31 @@ void Database::updatePath(const QString& jsonString, QWebSocket* wClient) {
         return;
     }
 
+    // Update all device_station paths
     QSqlQuery updateQuery(db);
-    updateQuery.prepare(R"(
-        UPDATE device_station SET storage_path = :path
-    )");
+    updateQuery.prepare("UPDATE device_station SET storage_path = :path");
     updateQuery.bindValue(":path", newPath);
 
     if (!updateQuery.exec()) {
-        qWarning() << "Failed to update storage_path:" << updateQuery.lastError().text();
+        qWarning() << "❌ Failed to update storage_path:" << updateQuery.lastError().text();
     } else {
-        qDebug() << "All device_station rows updated with new storage_path:" << newPath;
+        qDebug() << "✅ Updated device_station.storage_path to:" << newPath;
 
+        // Now sync record_files.file_path
+        QSqlQuery syncQuery(db);
+        QString syncSql = R"(
+            UPDATE record_files rf
+            JOIN device_station ds ON rf.name = ds.name
+            SET rf.file_path = ds.storage_path
+            WHERE rf.file_path IS NOT NULL
+        )";
+        if (!syncQuery.exec(syncSql)) {
+            qWarning() << "❌ Failed to sync file_path:" << syncQuery.lastError().text();
+        } else {
+            qDebug() << "✅ record_files.file_path synced successfully.";
+        }
+
+        // Send WebSocket reply
         QJsonObject reply;
         reply["menuID"] = "UpdatePathDirectory";
         reply["status"] = "success";
@@ -966,6 +1304,50 @@ void Database::updatePath(const QString& jsonString, QWebSocket* wClient) {
 
     db.close();
 }
+
+//void Database::updatePath(const QString& jsonString, QWebSocket* wClient) {
+//    qDebug() << "updatePath received:" << jsonString;
+
+//    QByteArray br = jsonString.toUtf8();
+//    QJsonDocument doc = QJsonDocument::fromJson(br);
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() != "changePathDirectory") {
+//        qWarning() << "Invalid menuID.";
+//        return;
+//    }
+
+//    QString newPath = obj["ChangePathDirectory"].toString();
+//    if (newPath.isEmpty()) {
+//        qWarning() << "Empty path received.";
+//        return;
+//    }
+
+//    if (!db.isOpen() && !db.open()) {
+//        qWarning() << "Failed to open database:" << db.lastError().text();
+//        return;
+//    }
+
+//    QSqlQuery updateQuery(db);
+//    updateQuery.prepare(R"(
+//        UPDATE device_station SET storage_path = :path
+//    )");
+//    updateQuery.bindValue(":path", newPath);
+
+//    if (!updateQuery.exec()) {
+//        qWarning() << "Failed to update storage_path:" << updateQuery.lastError().text();
+//    } else {
+//        qDebug() << "All device_station rows updated with new storage_path:" << newPath;
+
+//        QJsonObject reply;
+//        reply["menuID"] = "UpdatePathDirectory";
+//        reply["status"] = "success";
+//        reply["newPath"] = newPath;
+//        wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+//    }
+
+//    db.close();
+//}
 
 
 
@@ -991,14 +1373,20 @@ void Database::getRegisterDevicePage(const QString& jsonString, QWebSocket* wCli
         deviceObj["ip"] = query.value("ip").toString();
         deviceObj["uri"] = query.value("uri").toString();
         deviceObj["freq"] = query.value("freq").toInt();
+
         deviceObj["ambient"] = query.value("ambient").isNull() ? QJsonValue("NULL") : query.value("ambient").toInt();
         deviceObj["group"] = query.value("group").toInt();
         deviceObj["visible"] = query.value("visible").toInt();
         deviceObj["file_path"] = query.value("storage_path").toString();
         deviceObj["last_access"] = query.value("last_access").isNull() ? QJsonValue("NULL") : query.value("last_access").toString();
 
+        // ✅ เพิ่มใหม่
+        deviceObj["chunk"] = query.value("chunk").isNull() ? QJsonValue("NULL") : query.value("chunk").toInt();
+        deviceObj["updated_at"] = query.value("updated_at").isNull() ? QJsonValue("NULL") : query.value("updated_at").toString();
+
         deviceArray.append(deviceObj);
     }
+
     QJsonObject responseObj;
     responseObj["menuID"] = "deviceList";
     responseObj["devices"] = deviceArray;
@@ -1238,8 +1626,6 @@ void Database::removeRegisterDevice(const QString& jsonString, QWebSocket* wClie
 //    db.close();
 //}
 
-
-
 void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
     QByteArray br = msgs.toUtf8();
     QJsonDocument doc = QJsonDocument::fromJson(br);
@@ -1253,15 +1639,6 @@ void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
         return;
     }
 
-    // สร้าง map จากชื่อ device → storage_path
-    QMap<QString, QString> devicePathMap;
-    QSqlQuery queryPath("SELECT name, storage_path FROM device_station");
-    while (queryPath.next()) {
-        QString name = queryPath.value("name").toString();
-        QString path = queryPath.value("storage_path").toString();
-        devicePathMap[name] = path;
-    }
-
     QSqlQuery query("SELECT * FROM record_files ORDER BY created_at DESC");
     if (!query.exec()) {
         qWarning() << "Query failed:" << query.lastError().text();
@@ -1272,34 +1649,21 @@ void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
     int count = 0;
 
     while (query.next()) {
-        QString device = query.value("device").toString();
-        QString filename = query.value("filename").toString();
-        QString basePath = devicePathMap.value(device, "");
+        QString filePath = query.value("file_path").toString().trimmed();
+        QString filename = query.value("filename").toString().trimmed();
 
-        // Default fallback path if not found
-        if (basePath.isEmpty()) basePath = "/media/SSD1";
-
-        // Parse filename: expected format FREQ_YYYYMMDD_CH_...wav
-        QStringList parts = filename.split('_');
-        QString subPath = "unknown";
-
-        if (parts.size() >= 3) {
-            QString freq = parts[0];
-            QString date = parts[1];
-            QString ch = parts[2];
-            subPath = freq + "/" + date + "/" + ch;
-        }
-
-        QString fullPath = basePath + "/" + subPath + "/" + filename;
+        // ถ้า file_path เป็น NULL จริง ๆ ก็จะเป็นค่าว่าง ""
+        QString fullPath = filePath + "/" + filename;
 
         QJsonObject record;
         record["id"] = QString(query.value("id").toByteArray().toHex());
-        record["device"] = device;
+        record["device"] = query.value("device").toString();
         record["filename"] = filename;
         record["created_at"] = query.value("created_at").toString();
         record["continuous_count"] = query.value("continuous_count").toInt();
-        record["file_path"] = basePath + "/" + subPath;
+        record["file_path"] = filePath;
         record["full_path"] = fullPath;
+        record["name"] = query.value("name").toString();
 
         recordsArray.append(record);
         count++;
@@ -1316,6 +1680,85 @@ void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
 
     db.close();
 }
+
+
+//void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
+//    QByteArray br = msgs.toUtf8();
+//    QJsonDocument doc = QJsonDocument::fromJson(br);
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() != "getRecordFiles")
+//        return;
+
+//    if (!db.isOpen() && !db.open()) {
+//        qWarning() << "Failed to open database:" << db.lastError().text();
+//        return;
+//    }
+
+//    // สร้าง map จากชื่อ device → storage_path
+//    QMap<QString, QString> devicePathMap;
+//    QSqlQuery queryPath("SELECT name, storage_path FROM device_station");
+//    while (queryPath.next()) {
+//        QString name = queryPath.value("name").toString();
+//        QString path = queryPath.value("storage_path").toString();
+//        devicePathMap[name] = path;
+//    }
+
+//    QSqlQuery query("SELECT * FROM record_files ORDER BY created_at DESC");
+//    if (!query.exec()) {
+//        qWarning() << "Query failed:" << query.lastError().text();
+//        return;
+//    }
+
+//    QJsonArray recordsArray;
+//    int count = 0;
+
+//    while (query.next()) {
+//        QString device = query.value("device").toString();
+//        QString filename = query.value("filename").toString();
+//        QString basePath = devicePathMap.value(device, "");
+
+//        // Default fallback path if not found
+//        if (basePath.isEmpty()) basePath = "/media/SSD1";
+
+//        // Parse filename: expected format FREQ_YYYYMMDD_CH_...wav
+//        QStringList parts = filename.split('_');
+//        QString subPath = "unknown";
+
+//        if (parts.size() >= 3) {
+//            QString freq = parts[0];
+//            QString date = parts[1];
+//            QString ch = parts[2];
+//            subPath = freq + "/" + date + "/" + ch;
+//        }
+
+//        QString fullPath = basePath + "/" + subPath + "/" + filename;
+
+//        QJsonObject record;
+//        record["id"] = QString(query.value("id").toByteArray().toHex());
+//        record["device"] = device;
+//        record["filename"] = filename;
+//        record["created_at"] = query.value("created_at").toString();
+//        record["continuous_count"] = query.value("continuous_count").toInt();
+//        record["file_path"] = basePath + "/" + subPath;
+//        record["full_path"] = fullPath;
+//        record["name"] = query.value("name").toString();
+
+//        recordsArray.append(record);
+//        count++;
+//        qDebug() << "#" << count << "File:" << filename << "→" << fullPath;
+//    }
+
+//    QJsonObject mainObj;
+//    mainObj["objectName"] = "recordFilesList";
+//    mainObj["records"] = recordsArray;
+//    mainObj["count"] = count;
+
+//    QJsonDocument docOut(mainObj);
+//    emit sendRecordFiles(docOut.toJson(QJsonDocument::Compact), wClient);
+
+//    db.close();
+//}
 
 //void Database::fetchAllRecordFiles(QString msgs, QWebSocket* wClient) {
 //    QByteArray br = msgs.toUtf8();

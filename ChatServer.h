@@ -102,7 +102,7 @@ signals:
 private Q_SLOTS:
     void onNewConnection();
 //    void commandProcess(QString message, QWebSocket *pSender);
-    void processMessage(QString message);
+//    void processMessage(QString message);
     void socketDisconnected();
     void sendMessage(QString, QWebSocket *);
 
@@ -110,6 +110,7 @@ private Q_SLOTS:
 public slots:
     void sendMessageToMonitor(QString);
     void broadcastMessage(QString message);
+    void processMessage(QString message);
 
 private:
     QWebSocketServer *m_pWebSocketServer;

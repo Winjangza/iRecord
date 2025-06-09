@@ -24,9 +24,9 @@
 #define LINE2INDEX1          		 66
 #define LINE2INDEX2          		 98
 #define LINE3INDEX1          		 130
-#define LINE3INDEX2          		 162
-#define LINE4INDEX1          		 194
-#define LINE4INDEX2          		 226
+//#define LINE3INDEX2          		 162
+#define LINE4INDEX1          		 162
+//#define LINE4INDEX2          		 226
 #define GPS1STAGE           66
 #define GPS2STAGE           67
 #define LINE3INDEX          68

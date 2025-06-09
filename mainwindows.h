@@ -43,6 +43,13 @@
 #include <QTextStream>
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
+#include <QtConcurrent>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include "Unixsocketlistener.h"
+#include <QWebSocketServer>
+#include <QWebSocket>
+
 #define CODECMAX9850  "7"
 #define CODECI2CADDR   0x10
 #define GPIO01	"PQ.05"     //"453"		//GPIO33_PQ.05		tegra234-gpio = (15*8)+5 = 125
@@ -67,8 +74,11 @@
 class mainwindows: public QObject
 {
      Q_OBJECT
+
 public:
     explicit mainwindows(QObject *parent = nullptr);
+
+
 //    int registerMax9850();
 signals:
 
@@ -77,6 +87,7 @@ signals:
     void mainwindowsMesg(QString, QWebSocket*);
     void updateNetwork(QString ,QString ,QString ,QString ,QString , QString);
     void triggerRotary(int encoderNum, int val, int inputEventID);
+    void messageReceived(const QString& message);
 public slots:
 
     void mesgManagement(QString);
@@ -104,9 +115,23 @@ public slots:
     void playWavFile(const QString& filePath);
     void formatExternal(const QString &filePath);
     void runBuildAndRestartServices();
+    void stopLiveStream(QString, QWebSocket*);
+    void syncNTPServer(QString,QWebSocket*);
+    void startNTPServer(QString,QWebSocket*);
+    void recordDeviceLiveStream(QString,QWebSocket*);
+//    void autoLiveStream(QString);
+
+//    void handleReadyRead();
+//    QString getUPTime();
+//    QString readLine(QString fileName);
 private:
+    QTimer* localTimeBroadcastTimer = nullptr;
+    QProcess* unixSocketReaderProc = nullptr;
+    QTimer* ntpBroadcastTimer = nullptr;
+    QTimer* liveStreaming = nullptr;
+    QProcess* ffmpegProcess = nullptr;
     FileDownloader *downloader = nullptr;
-    QString SwVersion = "27052025 0.9"; //ในนี้จะต่ำกว่าในเว็บ 0.1 version
+    QString SwVersion = "04062025 1.3"; //ในนี้จะต่ำกว่าในเว็บ 0.1 version
     bool foundfileupdate = false;
     int updateStatus = 0;
     Max9850 *max9850;
@@ -137,6 +162,7 @@ private:
     QString display2line4;
     QString newdisplay2line4;
     QList<int> activeStreamIds;
+    QString currentLocationTimezone;
     QString getDeviceFromMount(const QString& mountPath) {
         QString cmd = QString("findmnt -n -o SOURCE --target %1").arg(mountPath);
         FILE* pipe = popen(cmd.toUtf8().data(), "r");
@@ -194,6 +220,7 @@ private:
 //    boost::atomic_bool m_IsEventThreadRunning;
 //    boost::shared_ptr<boost::thread> *m_EventThreadInstance;
 
+
     struct phyNetwork{
         QString dhcpmethod;
         QString ipaddress;
@@ -219,6 +246,10 @@ private:
     static void* ThreadFunc3(void* pTr);
     typedef void * (*THREADFUNCPTR3)(void *);
 
+    bool broadcastTime = false;
+    QWebSocket* broadcastClient = nullptr;
+    pthread_t broadcastThread;
+
     pthread_t idThread;
     pthread_t idThread2;
     pthread_t idThread3;
@@ -226,7 +257,7 @@ private:
 
 
     unsigned char VolumeOut = 255;
-    int currentVolume;
+    int currentVolume = currentVolume % 64;
     int updatelevel;
 
     float CPUtemp, GPUtemp;
@@ -243,7 +274,17 @@ private:
     double rootUsedGB = 0, rootTotalGB = 0;
     double extUsedGB = 0, extTotalGB = 0;
 
+    QMap<int, QProcess*> ffmpegProcessMap;
+    QString lastGetCurrentTime = "";
+    bool enableBroadcast = false;
+    bool threadStarted = false;
 
+
+    int socketFd;
+    QSocketNotifier* notifier;
+    QString socketPath = "/tmp/recd_status.sock";
+
+    void setupSocket();
 };
 
 #endif // MAINWINDOWS_H

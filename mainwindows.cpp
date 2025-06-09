@@ -17,13 +17,14 @@ mainwindows::mainwindows(QObject *parent)
     QTimer *timer = new QTimer(this);
     dashboardTimer = new QTimer(this);
     downloader = new FileDownloader;
-
+    UnixSocketListener* unixReceiver = new UnixSocketListener(this);
+    liveStreaming = new QTimer(this);
     wClient = new QWebSocket();
     Timer = new QTimer();
     client = new SocketClient();
     QTimer *diskTimer = new QTimer(this);
     RotaryEncoderButtonL = new GetInputEvent("/dev/input/by-path/platform-gpio-keys-event",1,28,this);
-    RotaryEncoder01 = new GetInputEvent("/dev/input/by-path/platform-rotary@1-event",2,1,this);
+    RotaryEncoder01 = new GetInputEvent("/dev/input/by-path/platform-rotary@2-event",2,1,this);
     gpioAmp = new GPIOClass(CODEC_RESET_PIN);
     gpioAmp->export_gpio();
     gpioAmp->setdir_gpio("out");
@@ -35,34 +36,62 @@ mainwindows::mainwindows(QObject *parent)
     uint32_t sysclkHz = 12000000;
     uint32_t sampleRate = 8000;
 //     Connect WebSocketClient to localhost:1235
-    client->createConnection("127.0.0.1", 1237);
+//    client->createConnection("127.0.0.1", 1237);
 
-    connect(client, &SocketClient::Connected, this, []() {
-        qDebug() << "mainwindows: SocketClient connected!";
+//    connect(client, &SocketClient::Connected, this, []() {
+//        qDebug() << "mainwindows: SocketClient connected!";
+//    });
+//    connect(client, &SocketClient::newCommandProcess, this, [=](QString msg) {
+//        qDebug() << "mainwindows: Message received via SocketClient:" << msg;
+
+//        QJsonParseError parseError;
+//        QJsonDocument doc = QJsonDocument::fromJson(msg.toUtf8(), &parseError);
+
+//        if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
+//            QJsonObject obj = doc.object();
+//            QString menuID = obj.value("menuID").toString();
+//            QString messageText = obj.value("message").toString();
+
+//            if (menuID == "rec_event") {
+//                manageData(msg, wClient);
+//            }
+//        } else {
+//            qDebug() << "Parse error:" << parseError.errorString();
+//        }
+//    });
+
+
+
+    connect(unixReceiver, &UnixSocketListener::messageReceived, this, [=](const QString& msg) {
+        qDebug() << "mainwindows: Received message from socket:" << msg;
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(msg.toUtf8(), &err);
+//        if (err.error == QJsonParseError::NoError && doc.isObject()) {
+//            QJsonObject obj = doc.object();
+            recordDeviceLiveStream(msg, wClient);
+//        }
+//        QStringList msgSplit = msg.split(",", Qt::SkipEmptyParts);
+//        if(msgSplit.size() >= 4){
+//            QString ip     = msgSplit[0].trimmed();
+//            QString freq   = msgSplit[1].trimmed();
+//            QString uri    = msgSplit[2].trimmed();
+//            QString action = msgSplit[3].trimmed();
+
+//            qDebug() << "IP:" << ip << "Freq:" << freq << "URI:" << uri << "Action:" << action;
+//            if(ip != ""){
+//                autoLiveStream(ip);
+//            }
+//        }
+
     });
-    connect(client, &SocketClient::newCommandProcess, this, [=](QString msg) {
-        qDebug() << "mainwindows: Message received via SocketClient:" << msg;
 
-        QJsonParseError parseError;
-        QJsonDocument doc = QJsonDocument::fromJson(msg.toUtf8(), &parseError);
-
-        if (parseError.error == QJsonParseError::NoError && doc.isObject()) {
-            QJsonObject obj = doc.object();
-            QString menuID = obj.value("menuID").toString();
-            QString messageText = obj.value("message").toString();
-
-            if (menuID == "rec_event") {
-                manageData(msg, wClient);
-            }
-        } else {
-            qDebug() << "Parse error:" << parseError.errorString();
-        }
-    });
-
-
+    system("sudo hwclock -s");
     connect(wClient, &QWebSocket::connected, this, []() {
     qDebug() << "WebSocket connected!";});
     wClient->open(QUrl("ws://localhost:1234"));
+
+
+
 //--------------------------------------mainwindows------------------------------------------------//
     connect(this, &mainwindows::requestUpdateDateTime, this, &mainwindows::getDateTime);
     connect(this, SIGNAL(mainwindowsMesg(QString, QWebSocket*)), SocketServer, SLOT(sendMessage(QString, QWebSocket*)));
@@ -78,9 +107,9 @@ mainwindows::mainwindows(QObject *parent)
 //--------------------------------------WebServer------------------------------------------------//
     connect(SocketServer, SIGNAL(newCommandProcess(QString, QWebSocket*)), this, SLOT(manageData(QString, QWebSocket*)));
     connect(SocketServer, SIGNAL(newCommandProcess(QString, QWebSocket*)), this, SLOT(dashboardManage(QString, QWebSocket*)));
-
     connect(dashboardTimer, &QTimer::timeout, this, [=]() {dashboardManage(dashboardMsg, clientSocket);});
     connect(downloader,SIGNAL(downloadCompleted(const QString)), this, SLOT(downloadCompleted(const QString)));
+    connect(SocketServer, SIGNAL(newCommandProcess(QString, QWebSocket*)), this, SLOT(startNTPServer(QString, QWebSocket*)));
 
     int ret;
     ret=pthread_create(&idThread, NULL, ThreadFunc, this);
@@ -107,6 +136,8 @@ mainwindows::mainwindows(QObject *parent)
         qDebug() <<("Thread3 not created.\n");
     }
 
+
+
     if (max9850->initialize(sampleRate)) {
         qDebug() << "MAX9850 initialized successfully";
     } else {
@@ -119,6 +150,9 @@ mainwindows::mainwindows(QObject *parent)
     mydatabase->updateRecordVolume();
     mydatabase->CheckandVerifyDatabases();
     mydatabase->maybeRunCleanup();
+    mydatabase->linkRecordChannelWithDeviceStation();
+    mydatabase->linkRecordFilesWithDeviceStationOnce();
+
 }
 
 void mainwindows::verifySSDandBackupFile() {
@@ -179,6 +213,7 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
     if (obj["menuID"].toString() == "getMonitorPage") {
         dashboardMsg = msgs;
         clientSocket = wClient;
+
         // DateTime
         QDateTime currentDateTime = QDateTime::currentDateTime();
         QString formattedDateTime = currentDateTime.toString("yyyy/MM/dd HH:mm:ss");
@@ -221,6 +256,7 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
         for (int i = 1; i < cpuLines.size(); ++i) {
             cpuUsageList.append(cpuLines[i].trimmed());
         }
+
 //        qDebug() << "cpuUsageList:" << cpuUsageList;
 
         // CPU & GPU Temperature
@@ -359,7 +395,7 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
 
         QJsonObject mainObject;
         mainObject.insert("menuID", "currentDirectoryPath");
-        mainObject.insert("currentRecordDirectory", currentRecordDirectory);
+        mainObject.insert("currentRecordDirectory", currentRecordDirectoryInit);
         QJsonDocument jsonDoc(mainObject);
         QString jsonString = jsonDoc.toJson(QJsonDocument::Compact);
         qDebug() << "Current Record directory:" << jsonString;
@@ -369,9 +405,13 @@ void mainwindows::dashboardManage(QString msgs, QWebSocket* wClient) {
 //            runBuildAndRestartServices();
         }
     }
+
+
 }
 
 void mainwindows::setdefaultPath(QString megs, QWebSocket* wClient) {
+    qDebug() << "setdefaultPath:" << megs;
+
     QString ssd1Path = "/media/SSD1";
     QString ssd2Path = "/media/SSD2";
     QString fallbackPath = "/media/INTERNAL";
@@ -461,6 +501,87 @@ void mainwindows::setdefaultPath(QString megs, QWebSocket* wClient) {
     }
 }
 
+
+
+// mainwindows.cpp
+void mainwindows::recordDeviceLiveStream(QString megs, QWebSocket* wClient) {
+    mydatabase->lookupDeviceStationByIp(megs, wClient);
+}
+
+//void mainwindows::recordDeviceLiveStream(QString megs, QWebSocket* wClient) {
+//    QtConcurrent::run([=]() {
+//           qDebug() << "recordDeviceLiveStream:" << megs;
+
+//           QStringList parts = megs.split(",");
+//           if (parts.size() != 4) {
+//               qWarning() << "Invalid message format";
+//               return;
+//           }
+
+//           QString ip = parts[0].trimmed();
+//           QString freq = parts[1].trimmed();
+//           QString url = parts[2].trimmed();
+//           QString action = parts[3].trimmed();
+
+//           QJsonObject obj;
+//           obj["ip"] = ip;
+//           obj["freq"] = freq;
+//           obj["url"] = url;
+//           obj["action"] = action;
+
+//           mydatabase->mysqlRecordDevice(obj);
+
+//           if (!ip.isEmpty() && !freq.isEmpty() && !url.isEmpty() && !action.isEmpty()) {
+//               QJsonObject response;
+//               response["menuID"] = "realTimerecord";
+//               response["data"] = obj;
+//               QJsonDocument doc(response);
+//               QString resultJson = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+
+//               QMetaObject::invokeMethod(qApp, [=]() {
+//                   if (wClient && wClient->isValid()) {
+//                       wClient->sendTextMessage(resultJson);
+//                       qDebug() << "record_Device_LiveStream:" << resultJson;
+//                   }
+//               }, Qt::QueuedConnection);
+//           }
+//       });
+////    qDebug() << "recordDeviceLiveStream:" << megs;
+
+////    QStringList parts = megs.split(",");
+////    if (parts.size() != 4) {
+////        qWarning() << "Invalid message format";
+////        return;
+////    }
+
+////    QString ip = parts[0].trimmed();
+////    QString freq = parts[1].trimmed();
+////    QString url = parts[2].trimmed();
+////    QString action = parts[3].trimmed();
+
+////    QJsonObject obj;
+////    obj["ip"] = ip;
+////    obj["freq"] = freq;
+////    obj["url"] = url;
+////    obj["action"] = action;
+
+////    mydatabase->mysqlRecordDevice(obj);
+
+////    QJsonObject response;
+////    response["menuID"] = "realTimerecord";
+////    response["data"] = obj;
+////    QJsonDocument doc(response);
+////    QString resultJson = QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+////    if(obj["ip"].toString() != "" && obj["freq"].toString() != "" && obj["url"].toString() != "" && obj["action"].toString() != ""){
+////        if (wClient) {
+////            wClient->sendTextMessage(resultJson);
+////            qDebug() << "record_Device_LiveStream:" << resultJson;
+////        }
+////    }
+
+//}
+
+
 void mainwindows::manageData(QString megs, QWebSocket* wClient){
     QByteArray br = megs.toUtf8();
     QJsonDocument doc = QJsonDocument::fromJson(br);
@@ -542,21 +663,24 @@ void mainwindows::manageData(QString megs, QWebSocket* wClient){
     }else if (obj["menuID"].toString() == "playFileWav") {
         qDebug() << "Received request to play file:" << megs;
 
-        QString fileName = obj["fileName"].toString().trimmed();
-        QString pathDirectory = obj["filePath"].toString().trimmed();
+        QString fileName = obj["fileName"].toString().trimmed(); // เช่น 121950_20250605_2_105508_95382635.wav
+        QString basePath = obj["filePath"].toString().trimmed(); // เช่น /home/orinnx/audioRec
 
-        if (fileName.endsWith(".wav") && !pathDirectory.endsWith(".wav")) {
-            std::swap(fileName, pathDirectory);
+        QStringList parts = fileName.split('_');
+        if (parts.size() < 4) {
+            qWarning() << "❌ Invalid filename format:" << fileName;
+            return;
         }
 
-        QString fullPath = fileName+ "/" + pathDirectory;
-//        QString fullPath = pathDirectory+ "/" + fileName;
+        QString freq = parts[0];
+        QString date = parts[1];
+        QString ch = parts[2];
 
-        qDebug() << "Playing file from full path:" << fullPath << pathDirectory << fileName;
+        QString fullPath = QString("%1/%2/%3/%4/%5").arg(basePath, freq, date, ch, fileName);
+        qDebug() << "✅ Playing file from full path:" << fullPath;
 
         playWavFile(fullPath);
-    }
-else if (obj["menuID"].toString() == "deleteDevice") {
+    }else if (obj["menuID"].toString() == "deleteDevice") {
         mydatabase->removeRegisterDevice(megs,wClient);
     }else if (obj["menuID"].toString() == "selectPath") {
         handleSelectPath(obj, wClient);
@@ -566,15 +690,25 @@ else if (obj["menuID"].toString() == "deleteDevice") {
     }else if (obj["menuID"].toString() == "getRecordChannel") {
         qDebug() << "getReccordChannel:" << megs;
         mydatabase->selectRecordChannel(megs,wClient);
+//        startUnixSocketReader(wClient);
+    }else if (obj["menuID"].toString() == "getRecordChannel2") {
+        qDebug() << "getReccordChannel:" << megs;
+        wClient->sendTextMessage("autoPlay");
+        system("sudo systemctl restart AudioStreamServer.service");
+
     }else if (obj["menuID"].toString() == "startLiveStream") {
         qDebug() << "startLiveStream:" << megs;
         liveSteamRecordRaido(megs,wClient);
+    }else if (obj["menuID"].toString() == "stopLiveStream") {
+        qDebug() << "stopLiveStream:" << megs;
+        stopLiveStream(megs,wClient);
     }else if (obj["menuID"].toString() == "updateFirmware") {
         qDebug() << "updateFirmware:" << megs;
         updateSystem(megs);
     }else if (obj["menuID"].toString() == "formatExternal") {
         qDebug() << "formatExternal:" << megs;
         formatExternal(megs);
+        mydatabase->formatDatabases(megs);
     }else if (obj["menuID"].toString() == "getSystemPage") {
         qDebug() << "getSystemPage:" << megs;
 
@@ -623,9 +757,142 @@ else if (obj["menuID"].toString() == "deleteDevice") {
         if (wClient) {
             wClient->sendTextMessage(jsonString);
         }
+    }else if (obj["menuID"].toString() == "setLocation") {
+        QString location = obj["location"].toString().trimmed();
+
+        if (!location.isEmpty()) {
+            currentLocationTimezone = location;
+            qDebug() << "Location set to:" << currentLocationTimezone;
+        }
+    }else if (obj["menuID"].toString() == "updateNTPServer") {
+        qDebug() << "updateNTPServer:" << megs;
+        syncNTPServer(megs,wClient);
+
+    }
+}
+
+void mainwindows::syncNTPServer(QString megs, QWebSocket* wClient) {
+    qDebug() << "syncNTPServer:" << megs;
+
+    // Parse input JSON
+    QJsonDocument doc = QJsonDocument::fromJson(megs.toUtf8());
+    if (!doc.isObject()) {
+        qWarning() << "Invalid JSON format.";
+        return;
+    }
+
+    QJsonObject obj = doc.object();
+    QString ntpIP = obj["ntpServer"].toString();  // ตัวอย่าง "192.168.10.66"
+    if (ntpIP.isEmpty()) {
+        qWarning() << "Empty NTP IP address.";
+        return;
+    }
+
+    QString configPath = "/etc/systemd/timesyncd.conf";
+
+    QFile file(configPath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Failed to open:" << configPath;
+        return;
+    }
+
+    QString content = file.readAll();
+    file.close();
+
+    QStringList lines = content.split('\n');
+    bool ntpLineFound = false;
+
+    for (int i = 0; i < lines.size(); ++i) {
+        if (lines[i].trimmed().startsWith("NTP=")) {
+            lines[i] = QString("NTP=%1 %2").arg(ntpIP, "pool.ntp.org 0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org ntp.ubuntu.com");
+            ntpLineFound = true;
+            break;
+        }
+    }
+
+    if (!ntpLineFound) {
+        // Append [Time] section and NTP config if not found
+        lines << "[Time]";
+        lines << QString("NTP=%1 pool.ntp.org 0.ubuntu.pool.ntp.org 1.ubuntu.pool.ntp.org ntp.ubuntu.com").arg(ntpIP);
+        lines << "FallbackNTP=0.pool.ntp.org 1.pool.ntp.org 0.fr.pool.ntp.org";
+    }
+
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        qWarning() << "Failed to write:" << configPath;
+        return;
+    }
+
+    QTextStream out(&file);
+    out << lines.join('\n');
+    file.close();
+
+    // Restart the timesyncd service and manually sync time
+    QProcess::execute("sudo systemctl restart systemd-timesyncd.service");
+    QProcess::execute(QString("sudo ntpdate %1").arg(ntpIP));
+
+    // Read the current time from system
+    QProcess dateProc;
+    dateProc.start("date");
+    dateProc.waitForFinished();
+    QString systemTime = dateProc.readAllStandardOutput().trimmed();
+
+    qDebug() << "System time after sync:" << systemTime;
+
+    QJsonObject response;
+    response["menuID"] = "syncNTPServerResult";
+    response["ip"] = ntpIP;
+    response["systemTime"] = systemTime;
+
+    QJsonDocument jsonDoc(response);  // ✅ ใส่หลังจาก response มีข้อมูล
+    QString jsonString = jsonDoc.toJson(QJsonDocument::Compact);
+
+    wClient->sendTextMessage(jsonString);
+    startNTPServer(jsonString, wClient);
+
+}
+
+void mainwindows::startNTPServer(QString mesg, QWebSocket* wClient) {
+    QByteArray br = mesg.toUtf8();
+    QJsonDocument doc = QJsonDocument::fromJson(br);
+    QJsonObject obj = doc.object();
+
+    qDebug() << "startNTPServer:" << mesg;
+    if(obj["menuID"].toString() == "getSystemPage"  && obj["menuID"].toString() == "updateNTPServer"){
+        if(ntpBroadcastTimer){
+            ntpBroadcastTimer->stop();
+            ntpBroadcastTimer->deleteLater();
+            ntpBroadcastTimer = nullptr;
+        }
+
+        ntpBroadcastTimer = new QTimer(this);
+        connect(ntpBroadcastTimer, &QTimer::timeout, this, [wClient]() {
+            if (!wClient || !wClient->isValid())
+                return;
+
+            QDateTime dt = QDateTime::currentDateTime();
+            QString timeStr = dt.time().toString("HH:mm:ss");
+            QString dateStr = dt.date().toString("yyyy-MM-dd");
+
+            qDebug() << "Broadcasting time:" << timeStr << ", date:" << dateStr;
+
+            QJsonObject obj;
+            obj["menuID"] = "broadcastLocalTime";
+            obj["currentTime"] = timeStr;
+            obj["currentDate"] = dateStr;
+
+            QJsonDocument doc(obj);
+            QString jsonMsg = doc.toJson(QJsonDocument::Compact);
+            qDebug() << "Sending to WebSocket:" << jsonMsg;
+
+            wClient->sendTextMessage(jsonMsg);
+        });
+
+        ntpBroadcastTimer->start(1000);
     }
 
 }
+
+
 
 void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) {
     QByteArray br = mesg.toUtf8();
@@ -644,7 +911,7 @@ void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) 
         newInterval = obj["timeIntervalpath"].toInt();
     }
 
-    QStringList configFiles = { FILESETTING, FILESETTINGPATH };
+    QStringList configFiles = { FILESETTING};
     QString latestPath = "";
     int latestInterval = -1;
 
@@ -706,6 +973,15 @@ void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) 
                 qWarning() << "Failed to write to config file:" << configFilePath;
             }
         }
+        // === Add symlink update here ===
+        QString symlinkPath = "/var/www/html/audiofiles";
+        QFile::remove(symlinkPath);  // remove existing link or file
+
+        if (!QFile::link(newPath, symlinkPath)) {
+            qWarning() << "❌ Failed to create symlink from" << newPath << "to" << symlinkPath;
+        } else {
+            qDebug() << "✅ Created symlink:" << symlinkPath << " -> " << newPath;
+        }
 
         // Keep track of last updated for WebSocket reply
         if (!newPath.isEmpty()) latestPath = newPath;
@@ -725,7 +1001,6 @@ void mainwindows::updateCurrentPathDirectory(QString mesg, QWebSocket* wClient) 
 
     if (wClient) {
         wClient->sendTextMessage(jsonString);
-        runBuildAndRestartServices();
     }
 }
 
@@ -831,21 +1106,21 @@ void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
 
         QStringList lines;
         QTextStream in(&file);
-        bool foundBindIp = false;
+//        bool foundBindIp = false;
 
-        while (!in.atEnd()) {
-            QString line = in.readLine();
-            if (line.trimmed().startsWith("bind_ip=")) {
-                line = "bind_ip=" + mesg;
-                foundBindIp = true;
-            }
-            lines << line;
-        }
-        file.close();
+//        while (!in.atEnd()) {
+//            QString line = in.readLine();
+//            if (line.trimmed().startsWith("bind_ip=")) {
+//                line = "bind_ip=" + mesg;
+//                foundBindIp = true;
+//            }
+//            lines << line;
+//        }
+//        file.close();
 
-        if (!foundBindIp) {
-            lines << "bind_ip=" + mesg;
-        }
+//        if (!foundBindIp) {
+//            lines << "bind_ip=" + mesg;
+//        }
 
         if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
             qWarning() << "Cannot open file for writing:" << filePath;
@@ -868,7 +1143,7 @@ void mainwindows::configDestinationIP(QString mesg, QWebSocket* wClient) {
         result["status"] = "ok";
         result["updated_ip"] = mesg;
         wClient->sendTextMessage(QJsonDocument(result).toJson(QJsonDocument::Compact));
-        runBuildAndRestartServices();
+//        runBuildAndRestartServices();
     }
 }
 
@@ -929,6 +1204,7 @@ void mainwindows::handleSelectPath(const QJsonObject &obj, QWebSocket* wClient) 
     qDebug() << "handleSelectPath() called";
     system("sudo rm -r /var/www/html/audiofiles");
     QString sourcePath = obj["path"].toString().trimmed();
+//    QString sourcePath = "/home/orinnx/audioRec";
     qDebug() << "Received sourcePath from JSON:" << sourcePath;
 
 //    if (!sourcePath.endsWith('/')) {
@@ -961,12 +1237,49 @@ void mainwindows::handleSelectPath(const QJsonObject &obj, QWebSocket* wClient) 
     }
 }
 
-
 void mainwindows::getDateTime()
 {
+    QProcess ntpCheck;
+    ntpCheck.start("timedatectl show -p NTPSynchronized --value");
+    ntpCheck.waitForFinished(1000);
+    QString ntpStatus = ntpCheck.readAllStandardOutput().trimmed();
+//    qDebug() << "NTP synchronized:" << ntpStatus;
+
+    QDateTime systemTime = QDateTime::currentDateTimeUtc();
+
+    QProcess hwclockProc;
+    hwclockProc.start("hwclock -r");  // Output: "2025-05-28 11:19:49.123456+00:00"
+    hwclockProc.waitForFinished(1000);
+    QString rtcOutput = hwclockProc.readAllStandardOutput().trimmed();
+//    qDebug() << "Raw RTC output:" << rtcOutput;
+
+    QDateTime rtcTime;
+
+    rtcTime = QDateTime::fromString(rtcOutput, Qt::ISODate);
+    if (!rtcTime.isValid() && rtcOutput.length() >= 19) {
+        // Fallback: strip fractional seconds if parsing fails
+        rtcTime = QDateTime::fromString(rtcOutput.left(19), "yyyy-MM-dd HH:mm:ss");
+        rtcTime.setTimeSpec(Qt::UTC);
+    }
+
+    if (rtcTime.isValid()) {
+        qint64 drift = qAbs(systemTime.secsTo(rtcTime));
+//        qDebug() << "Drift between system and RTC:" << drift << "seconds";
+
+        if (ntpStatus == "yes") {
+            system("hwclock -w");  // Write system time to RTC
+//            qDebug() << "NTP active → hwclock updated from system time.";
+        } else if (drift > 5) {
+            system("hwclock -s");  // Set system time from RTC
+//            qDebug() << "System clock synced from RTC (no NTP).";
+        } else {
+//            qDebug() << "Drift small, no sync needed.";
+        }
+    } else {
+//        qWarning() << "Failed to parse RTC time!";
+    }
 
     QDateTime currentDateTime = QDateTime::currentDateTime();
-//    qDebug() << "getDateTime:" << currentDateTime;
 
     const QDate d = currentDateTime.date();
     date = QString::number(d.year()) + '/'
@@ -977,11 +1290,36 @@ void mainwindows::getDateTime()
     time = QString::number(t.hour()).rightJustified(2, '0') + ':'
          + QString::number(t.minute()).rightJustified(2, '0') + ':'
          + QString::number(t.second()).rightJustified(2, '0');
+//    qDebug() << "date&&time:" << date << time;
 
     displayInfo->setTextLine1_1(date);
     displayInfo->setTextLine1_2(time);
     displayInfo->writeOLEDRun();
+
 }
+
+
+
+//void mainwindows::getDateTime()
+//{
+
+//    QDateTime currentDateTime = QDateTime::currentDateTime();
+////    qDebug() << "getDateTime:" << currentDateTime;
+
+//    const QDate d = currentDateTime.date();
+//    date = QString::number(d.year()) + '/'
+//         + QString::number(d.month()).rightJustified(2, '0') + '/'
+//         + QString::number(d.day()).rightJustified(2, '0');
+
+//    const QTime t = currentDateTime.time();
+//    time = QString::number(t.hour()).rightJustified(2, '0') + ':'
+//         + QString::number(t.minute()).rightJustified(2, '0') + ':'
+//         + QString::number(t.second()).rightJustified(2, '0');
+
+//    displayInfo->setTextLine1_1(date);
+//    displayInfo->setTextLine1_2(time);
+//    displayInfo->writeOLEDRun();
+//}
 
 void mainwindows::DirectoryManagement(QString pathDirectory)
 {
@@ -1108,7 +1446,7 @@ void mainwindows::editfileConfig(QString mesg)
 
         qDebug() << "Updated config file:" << cfgfile;
     }
-    runBuildAndRestartServices();
+//    runBuildAndRestartServices();
 }
 
 
@@ -1273,19 +1611,20 @@ void mainwindows::updateNewVolumeRecord(QString mesg) {
     displayInfo->writeOLEDRun();
 }
 
-
 void mainwindows::rotary(int encoderNum, int val, int InputEventID)
 {
     qDebug() << "rotary:" << encoderNum << val << InputEventID;
 
     if (val == -1) {
-        if (currentVolume > 0) currentVolume--;
-        qWarning() << "currentVolume--:" << currentVolume;
-
+        currentVolume--;
     } else if (val == 1) {
-        if (currentVolume < 0x3F) currentVolume++;
-        qWarning() << "currentVolume++:" << currentVolume;
+        currentVolume++;
     }
+
+    // จำกัดค่าระหว่าง 0–63
+    currentVolume = qBound(0, currentVolume, 63);
+
+    qDebug() << "Adjusted currentVolume:" << currentVolume;
 
     if (!max9850->setVolume(currentVolume)) {
         qWarning() << "Failed to set volume:" << currentVolume;
@@ -1295,66 +1634,118 @@ void mainwindows::rotary(int encoderNum, int val, int InputEventID)
     qDebug() << "Volume set to:" << currentVolume;
 
     int level = 0;
-    if (currentVolume >= 0x00 && currentVolume <= 0x05) {
-        level = 0;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        QString Volume = "Vol: ||||||||||||||";
-        QString maxVol = Volume+"max";
-        displayInfo->setTextLine4_1(maxVol);
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    QString volBar;
+
+    if (currentVolume <= 0x05) {
+        level = 0; volBar = "Vol: |||||||||||||| max";
     }
-    else if (currentVolume > 0x05 &&currentVolume <= 0x0D){
-        level = 1;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||||||||||||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x0D) {
+        level = 1; volBar = "Vol: ||||||||||||";
     }
-    else if (currentVolume > 0x0D &&currentVolume <= 0x15){
-        level = 2;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||||||||||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x15) {
+        level = 2; volBar = "Vol: ||||||||||";
     }
-    else if (currentVolume > 0x15 &&currentVolume <= 0x1E){
-        level = 3;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||||||||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x1E) {
+        level = 3; volBar = "Vol: ||||||||";
     }
-    else if (currentVolume > 0x1E &&currentVolume <= 0x26){
-        level = 4;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||||||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x26) {
+        level = 4; volBar = "Vol: ||||||";
     }
-    else if (currentVolume > 0x26 &&currentVolume <= 0x2E){
-        level = 5;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x2E) {
+        level = 5; volBar = "Vol: ||||";
     }
-    else if (currentVolume > 0x2E &&currentVolume <= 0x3E){
-        level = 6;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ||");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+    else if (currentVolume <= 0x3E) {
+        level = 6; volBar = "Vol: ||";
     }
     else {
-        level = 7;
-        qDebug() << "Volume set level to:" << currentVolume << level;
-        displayInfo->setTextLine4_1("Vol: ");
-        displayInfo->writeOLEDRun();
-        mydatabase->recordVolume(currentVolume,level);
+        level = 7; volBar = "Vol: ";
     }
-//    max9850->setVolume(currentVolume);
+
+    displayInfo->setTextLine4_1(volBar);
+    displayInfo->writeOLEDRun();
+    mydatabase->recordVolume(currentVolume, level);
 }
+
+//void mainwindows::rotary(int encoderNum, int val, int InputEventID)
+//{
+//    qDebug() << "rotary:" << encoderNum << val << InputEventID;
+
+//    if (val == -1) {
+//        if (currentVolume > 0) currentVolume--;
+//        qWarning() << "currentVolume--:" << currentVolume;
+
+//    } else if (val == 1) {
+//        if (currentVolume < 0x3F) currentVolume++;
+//        qWarning() << "currentVolume++:" << currentVolume;
+//    }
+
+//    if (!max9850->setVolume(currentVolume)) {
+//        qWarning() << "Failed to set volume:" << currentVolume;
+//        return;
+//    }
+
+//    qDebug() << "Volume set to:" << currentVolume;
+
+//    int level = 0;
+//    if (currentVolume >= 0x00 && currentVolume <= 0x05) {
+//        level = 0;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        QString Volume = "Vol: ||||||||||||||";
+//        QString maxVol = Volume+"max";
+//        displayInfo->setTextLine4_1(maxVol);
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x05 &&currentVolume <= 0x0D){
+//        level = 1;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||||||||||||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x0D &&currentVolume <= 0x15){
+//        level = 2;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||||||||||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x15 &&currentVolume <= 0x1E){
+//        level = 3;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||||||||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x1E &&currentVolume <= 0x26){
+//        level = 4;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||||||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x26 &&currentVolume <= 0x2E){
+//        level = 5;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else if (currentVolume > 0x2E &&currentVolume <= 0x3E){
+//        level = 6;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ||");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//    else {
+//        level = 7;
+//        qDebug() << "Volume set level to:" << currentVolume << level;
+//        displayInfo->setTextLine4_1("Vol: ");
+//        displayInfo->writeOLEDRun();
+//        mydatabase->recordVolume(currentVolume,level);
+//    }
+//}
 
 
 void mainwindows::displayVolumes()
@@ -1409,68 +1800,472 @@ void mainwindows::handleRecordFiles(const QString &jsonData)
     }
 }
 
+
 void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
     QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
     QJsonObject obj = doc.object();
 
-    if (obj["menuID"].toString() == "startLiveStream") {
-        int sid = obj["sid"].toInt();
-        QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
-        QString outputPath = QString("/home/orinnx/liveStream/ch%1.m3u8").arg(sid);
+    if (obj["menuID"].toString() != "startLiveStream")
+        return;
 
-        // ✅ Ensure symlink exists (one-time check)
-        QString symlinkPath = "/var/www/html/audiofiles";
-        QString targetPath = "/home/orinnx/liveStream";
-        QFileInfo symlinkInfo(symlinkPath);
-        if (symlinkInfo.exists() || symlinkInfo.isSymLink()) {
-            QFile::remove(symlinkPath);
-            qDebug() << "[Symlink] Removed old symlink:" << symlinkPath;
-        }
+    int sid = obj["sid"].toInt();
+    QString channel = QString("ch%1").arg(sid); // เช่น ch3
+    QString rtspUrl = QString("rtsp://127.0.0.1:654/live/%1/").arg(channel);
 
-        QProcess lnProc;
-        lnProc.start("ln", QStringList() << "-s" << targetPath << symlinkPath);
-        lnProc.waitForFinished();
-        qDebug() << "[Symlink] Created:" << symlinkPath << "→" << targetPath;
+    // ❌ ไม่ต้องเช็คหรือลบ process เก่า
 
-        // ✅ ffmpeg args
-        QStringList args;
-        args << "-i" << rtspUrl
-             << "-vn"
-             << "-acodec" << "aac"
-             << "-f" << "hls"
-             << "-hls_time" << "2"
-             << "-hls_list_size" << "3"
-             << "-hls_flags" << "delete_segments"
-             << outputPath;
+    QString outputDevice = "outLoop1"; // 🔧 หรือ generate ตาม sid เช่น "outLoop%1"
+    QProcess* process = new QProcess(this);
 
-        QProcess *ffmpegProc = new QProcess(this);
-        ffmpegProc->setProcessChannelMode(QProcess::MergedChannels);
-        connect(ffmpegProc, &QProcess::readyReadStandardOutput, [=]() {
-            qDebug() << "[ffmpeg output]" << ffmpegProc->readAllStandardOutput();
-        });
+    QStringList args = {
+        "-fflags", "+genpts",
+        "-use_wallclock_as_timestamps", "1",
+        "-i", rtspUrl,
+        "-ar", "8000",
+        "-ac", "1",
+        "-f", "alsa",
+        outputDevice
+    };
 
-        ffmpegProc->start("ffmpeg", args);
-        qDebug() << "[FFmpeg] Streaming sid:" << sid << "from" << rtspUrl << "to:" << outputPath;
+    process->setProgram("ffmpeg");
+    process->setArguments(args);
+    process->setProcessChannelMode(QProcess::MergedChannels);
 
-        // ✅ รอจนไฟล์ .m3u8 ถูกสร้าง
-        QFileInfo checkFile(outputPath);
-        int waitMs = 0;
-        while (!checkFile.exists() && waitMs < 3000) {
-            QThread::msleep(200);
-            waitMs += 200;
-            checkFile.refresh();
-        }
+    connect(process, &QProcess::readyReadStandardOutput, this, [=]() {
+        QByteArray output = process->readAllStandardOutput();
+        qDebug().noquote() << "[ffmpeg sid:" << sid << "]" << QString::fromUtf8(output).trimmed();
+    });
 
-        if (checkFile.exists()) {
-            QJsonObject reply;
-            reply["menuID"] = "streamStarted";
-            reply["sid"] = sid;
-            wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
-        } else {
-            qWarning() << "❌ Failed to generate .m3u8 file in time.";
-        }
+    connect(process, &QProcess::started, this, [=]() {
+        qDebug() << "ffmpeg started for sid:" << sid;
+    });
+
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [=](int exitCode, QProcess::ExitStatus status) {
+        qDebug() << "⚠ffmpeg exited for sid:" << sid << " code:" << exitCode;
+        process->deleteLater(); // cleanup
+    });
+
+    qDebug() << "Starting ffmpeg sid:" << sid << ":" << process->program() << args;
+    process->start();
+    bool started = process->waitForStarted();
+    if (started) {
+        ffmpegProcessMap[sid] = process;
+        qDebug() << "Stored process in ffmpegProcessMap for sid:" << sid;
+    } else {
+        qWarning() << "Failed to start ffmpeg for sid:" << sid;
+        process->deleteLater();
     }
 }
+
+
+
+void mainwindows::stopLiveStream(QString mesg, QWebSocket* wClient) {
+    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+    QJsonObject obj = doc.object();
+    qDebug() << "stopLiveStream" << mesg;
+    qDebug() << "📦 Available ffmpegProcessMap keys:" << ffmpegProcessMap.keys();
+    if (obj["menuID"].toString() == "stopLiveStream") {
+        int sid = obj["sid"].toInt();
+        qDebug() << "sid:" << sid;
+
+        if (ffmpegProcessMap.contains(sid)) {
+            qDebug() << "ffmpegProcessMap_sid:" << sid;
+
+            QProcess *proc = ffmpegProcessMap[sid];
+            qDebug() << "process ffmpeg:" << sid;
+            proc->terminate();
+            proc->waitForFinished(3000);
+            delete proc;
+            ffmpegProcessMap.remove(sid);
+
+            qDebug() << "🛑 Stopped FFmpeg for sid:" << sid;
+        } else {
+            qWarning() << "⚠️ No FFmpeg process found for sid:" << sid;
+        }
+
+        // ✅ Notify client
+        QJsonObject reply;
+        reply["menuID"] = "streamStopped";
+        reply["sid"] = sid;
+        wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+    }
+}
+
+
+
+
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() != "startLiveStream")
+//        return;
+
+//    int sid = obj["sid"].toInt();
+//    QString channel = QString("ch%1").arg(sid); // เช่น ch3
+//    QString rtspUrl = QString("rtsp://127.0.0.1:654/live/%1/").arg(channel);
+
+//    if (ffmpegProcess) {
+//        qDebug() << "🛑 Killing existing ffmpeg process";
+//        ffmpegProcess->kill();
+//        ffmpegProcess->deleteLater();
+//        ffmpegProcess = nullptr;
+//    }
+
+//    ffmpegProcess = new QProcess(this);
+//    QString outputDevice = "outLoop1";
+//    QStringList args = {
+//        "-fflags", "+genpts",
+//        "-use_wallclock_as_timestamps", "1",
+//        "-i", rtspUrl,
+//        "-ar", "8000",
+//        "-ac", "1",
+//        "-f", "alsa",
+//        outputDevice
+//    };
+
+//    ffmpegProcess->setProgram("ffmpeg");
+//    ffmpegProcess->setArguments(args);
+//    ffmpegProcess->setProcessChannelMode(QProcess::MergedChannels);
+
+//    connect(ffmpegProcess, &QProcess::readyReadStandardOutput, this, [=]() {
+//        QByteArray output = ffmpegProcess->readAllStandardOutput();
+//        qDebug().noquote() << "[ffmpeg output]" << QString::fromUtf8(output).trimmed();
+//    });
+
+//    connect(ffmpegProcess, &QProcess::started, this, [=]() {
+//        qDebug() << "ffmpeg started for sid:" << sid;
+//    });
+
+//    connect(ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+//            this, [=](int exitCode, QProcess::ExitStatus status) {
+//        qDebug() << "⚠️ ffmpeg exited with code:" << exitCode;
+//        ffmpegProcess->deleteLater();
+//        ffmpegProcess = nullptr;
+//    });
+
+//    qDebug() << "Running ffmpeg:" << ffmpegProcess->program() << args;
+//    ffmpegProcess->start();
+//}
+
+
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//      QJsonObject obj = doc.object();
+
+//      if (obj["menuID"].toString() != "startLiveStream")
+//          return;
+
+//      int sid = obj["sid"].toInt();
+//      QString channel = QString("ch%1").arg(sid); // เช่น ch3
+//      QString rtspUrl = QString("rtsp://127.0.0.1:654/live/%1/").arg(channel);
+
+//      // หยุด process เดิมถ้ามี
+//      if (ffmpegProcess) {
+//          qDebug() << "🛑 Killing existing ffmpeg process";
+//          ffmpegProcess->kill();
+//          ffmpegProcess->deleteLater();
+//          ffmpegProcess = nullptr;
+//      }
+
+//      // สร้างคำสั่ง ffmpeg ใหม่
+//      ffmpegProcess = new QProcess(this);
+//      QStringList args = {
+//          "-fflags", "+genpts",
+//          "-use_wallclock_as_timestamps", "1",
+//          "-i", rtspUrl,
+//          "-ar", "8000",
+//          "-ac", "1",
+//          "-f", "alsa",
+//          "outLoop1"
+//      };
+
+//      ffmpegProcess->setProgram("ffmpeg");
+//      ffmpegProcess->setArguments(args);
+//      ffmpegProcess->setProcessChannelMode(QProcess::MergedChannels);
+
+//      // log ข้อมูล stdout/stderr ถ้าต้องการ debug
+//      connect(ffmpegProcess, &QProcess::readyReadStandardOutput, this, [=]() {
+//          QByteArray output = ffmpegProcess->readAllStandardOutput();
+//          qDebug() << "[ffmpeg]" << output;
+//      });
+
+//      // เมื่อ ffmpeg เริ่ม
+//      connect(ffmpegProcess, &QProcess::started, this, [=]() {
+//          qDebug() << "ffmpeg started for sid:" << sid;
+//      });
+
+//      connect(ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+//              this, [=](int exitCode, QProcess::ExitStatus status) {
+//          qDebug() << "ffmpeg exited with code:" << exitCode;
+//          ffmpegProcess->deleteLater();
+//          ffmpegProcess = nullptr;
+//      });
+
+//      // เริ่ม process
+//      qDebug() << "Running ffmpeg:" << ffmpegProcess->program() << args;
+//      ffmpegProcess->start();
+//}
+
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() != "startLiveStream")
+//        return;
+
+//    int sid = obj["sid"].toInt();
+//    QString ip = obj["ip"].toString();
+//    QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
+//    QString outputBase = QString("/var/www/html/audiofiles/ch%1_part").arg(sid);
+
+//    // Start ffmpeg to create HLS files with segment rotation
+//    QStringList arguments;
+//    arguments << "-fflags" << "+genpts"
+//              << "-use_wallclock_as_timestamps" << "1"
+//              << "-i" << rtspUrl
+//              << "-codec" << "copy"
+//              << "-f" << "hls"
+//              << "-hls_time" << "5"                // 5-second segments
+//              << "-hls_list_size" << "1"           // only 1 segment in list
+//              << "-hls_segment_filename" << QString("%1%d.ts").arg(outputBase)
+//              << QString("%1%d.m3u8").arg(outputBase);  // chX_part1.m3u8, chX_part2.m3u8...
+
+//    QProcess *ffmpegProcess = new QProcess(this);
+//    ffmpegProcess->start("ffmpeg", arguments);
+//    ffmpegProcess->setProcessChannelMode(QProcess::MergedChannels);
+
+//    // Start timer to check for .m3u8 file existence and notify client
+//    QTimer *notifyTimer = new QTimer(this);
+//    notifyTimer->setInterval(1000); // check every 1 second
+//    int *part = new int(1);         // current part being monitored
+
+//    connect(notifyTimer, &QTimer::timeout, this, [=]() mutable {
+//        QString m3u8Filename = QString("ch%1_part%2.m3u8").arg(sid).arg(*part);
+//        QString fullPath = QString("/var/www/html/audiofiles/%1").arg(m3u8Filename);
+//        QFile checkFile(fullPath);
+
+//        if (checkFile.exists()) {
+//            QJsonObject reply;
+//            reply["menuID"] = "streamStarted";
+//            reply["sid"] = sid;
+//            reply["part"] = *part;
+//            reply["m3u8Path"] = QString("/audiofiles/%1").arg(m3u8Filename);
+
+//            if (wClient && wClient->isValid()) {
+//                wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+//            }
+
+//            *part = (*part % 3) + 1; // rotate part 1→2→3→1
+//        }
+//    });
+
+//    notifyTimer->start();
+
+//    // Optional: Clean up process and timer later
+//    connect(ffmpegProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+//            this, [=](int, QProcess::ExitStatus) {
+//                notifyTimer->stop();
+//                delete notifyTimer;
+//                delete part;
+//                ffmpegProcess->deleteLater();
+//            });
+//}
+
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() != "startLiveStream")
+//        return;
+
+//    int sid = obj["sid"].toInt();
+//    QString targetPath = "/home/orinnx/liveStream";
+//    QString symlinkPath = "/var/www/html/audiofiles";
+//    QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
+
+//    // สร้างโฟลเดอร์ถ้ายังไม่มี
+//    QDir().mkpath(targetPath);
+
+//    // ตั้ง symlink
+//    QFileInfo symlinkInfo(symlinkPath);
+//    if (symlinkInfo.exists() || symlinkInfo.isSymLink())
+//        QFile::remove(symlinkPath);
+//    QProcess::execute("ln", QStringList() << "-s" << targetPath << symlinkPath);
+
+//    // เริ่ม thread สำหรับวนลูปสตรีม
+//    QtConcurrent::run([=]() {
+//        int part = 1;
+//        while (true) {
+//            QString outputPath = QString("%1/ch%2_part%3.m3u8").arg(targetPath).arg(sid).arg(part);
+//            QStringList args;
+//            args << "-y" << "-i" << rtspUrl
+//                 << "-vn"
+//                 << "-acodec" << "aac"
+//                 << "-f" << "hls"
+//                 << "-hls_time" << "2"
+//                 << "-hls_list_size" << "3"
+//                 << "-hls_flags" << "delete_segments"
+//                 << outputPath;
+
+//            QProcess *ffmpegProc = new QProcess();
+//            ffmpegProc->setProcessChannelMode(QProcess::MergedChannels);
+
+//            QObject::connect(ffmpegProc, &QProcess::readyReadStandardOutput, [=]() {
+//                qDebug() << "[ffmpeg stdout]" << ffmpegProc->readAllStandardOutput().trimmed();
+//            });
+//            QObject::connect(ffmpegProc, &QProcess::readyReadStandardError, [=]() {
+//                qDebug() << "[ffmpeg stderr]" << ffmpegProc->readAllStandardError().trimmed();
+//            });
+
+//            ffmpegProc->start("ffmpeg", args);
+//            if (!ffmpegProc->waitForStarted(3000)) {
+//                qWarning() << "❌ FFmpeg failed to start for part" << part;
+//                delete ffmpegProc;
+//                continue;
+//            }
+
+//            // รอจนกว่าจะมี .m3u8
+//            QFileInfo checkFile(outputPath);
+//            int waitMs = 0;
+//            while (!checkFile.exists() && waitMs < 5000) {
+//                QThread::msleep(200);
+//                waitMs += 200;
+//                checkFile.refresh();
+//            }
+
+//            if (checkFile.exists()) {
+//                QJsonObject reply;
+//                reply["menuID"] = "streamStarted";
+//                reply["sid"] = sid;
+//                reply["part"] = part;
+//                reply["m3u8Path"] = QString("/audiofiles/ch%1_part%2.m3u8").arg(sid).arg(part);
+//                QMetaObject::invokeMethod(this, [=]() {
+//                    if (wClient && wClient->isValid()) {
+//                        wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+//                    }
+//                }, Qt::QueuedConnection);
+//            }
+
+//            // ปล่อย ffmpeg รันสักระยะ แล้ว kill แล้วหมุน part
+//            QThread::sleep(9);
+//            ffmpegProc->terminate();
+//            ffmpegProc->waitForFinished(2000);
+//            delete ffmpegProc;
+
+//            part = (part % 3) + 1; // 1 → 2 → 3 → 1 → ...
+//        }
+//    });
+//}
+
+
+
+//void mainwindows::stopLiveStream(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() == "stopLiveStream") {
+//        int sid = obj["sid"].toInt();
+
+//        // 🔴 หยุด process ก่อน
+//        if (ffmpegProcessMap.contains(sid)) {
+//            QProcess *proc = ffmpegProcessMap[sid];
+//            proc->terminate();
+//            proc->waitForFinished(3000);
+//            delete proc;
+//            ffmpegProcessMap.remove(sid);
+
+//            qDebug() << "🛑 Stopped FFmpeg for sid:" << sid;
+//        } else {
+//            qWarning() << "⚠️ No FFmpeg process found for sid:" << sid;
+//        }
+
+////        // 🧹 ลบไฟล์ที่เกี่ยวข้อง
+////        QString dirPath = "/home/orinnx/liveStream";
+////        QDir dir(dirPath);
+////        QStringList filters;
+////        filters << QString("ch%1_part*.m3u8").arg(sid)
+////                << QString("ch%1_part*.ts").arg(sid);  // ลบ segment ด้วย
+
+////        QFileInfoList filesToRemove = dir.entryInfoList(filters, QDir::Files);
+////        for (const QFileInfo &fileInfo : filesToRemove) {
+////            QFile::remove(fileInfo.absoluteFilePath());
+////            qDebug() << "🗑️ Deleted file:" << fileInfo.fileName();
+////        }
+
+//        // ✅ แจ้ง client
+//        QJsonObject reply;
+//        reply["menuID"] = "streamStopped";
+//        reply["sid"] = sid;
+//        wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+//    }
+//}
+
+
+//void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
+//    QJsonDocument doc = QJsonDocument::fromJson(mesg.toUtf8());
+//    QJsonObject obj = doc.object();
+
+//    if (obj["menuID"].toString() == "startLiveStream") {
+//        int sid = obj["sid"].toInt();
+//        QString rtspUrl = QString("rtsp://127.0.0.1:654/live/ch%1/").arg(sid);
+//        QString outputPath = QString("/home/orinnx/liveStream/ch%1.m3u8").arg(sid);
+
+//        QString symlinkPath = "/var/www/html/audiofiles";
+//        QString targetPath = "/home/orinnx/liveStream";
+//        QFileInfo symlinkInfo(symlinkPath);
+//        if (symlinkInfo.exists() || symlinkInfo.isSymLink()) {
+//            QFile::remove(symlinkPath);
+//            qDebug() << "Removed old symlink:" << symlinkPath;
+//        }
+
+//        QProcess lnProc;
+//        lnProc.start("ln", QStringList() << "-s" << targetPath << symlinkPath);
+//        lnProc.waitForFinished();
+//        qDebug() << "Created:" << symlinkPath << "→" << targetPath;
+
+//        QStringList args;
+//        args << "-i" << rtspUrl
+//             << "-vn"
+//             << "-acodec" << "aac"
+//             << "-f" << "hls"
+//             << "-hls_time" << "2"
+//             << "-hls_list_size" << "3"
+//             << "-hls_flags" << "delete_segments"
+//             << outputPath;
+
+//        QProcess *ffmpegProc = new QProcess(this);
+//        ffmpegProc->setProcessChannelMode(QProcess::MergedChannels);
+//        connect(ffmpegProc, &QProcess::readyReadStandardOutput, [=]() {
+//            qDebug() << "[ffmpeg output]" << ffmpegProc->readAllStandardOutput();
+//        });
+
+//        ffmpegProc->start("ffmpeg", args);
+//        qDebug() << "treaming sid:" << sid << "from" << rtspUrl << "to:" << outputPath;
+
+//        QFileInfo checkFile(outputPath);
+//        int waitMs = 0;
+//        while (!checkFile.exists() && waitMs < 3000) {
+//            QThread::msleep(200);
+//            waitMs += 200;
+//            checkFile.refresh();
+//        }
+
+//        if (checkFile.exists()) {
+//            QJsonObject reply;
+//            reply["menuID"] = "streamStarted";
+//            reply["sid"] = sid;
+//            wClient->sendTextMessage(QJsonDocument(reply).toJson(QJsonDocument::Compact));
+//        } else {
+//            qWarning() << "Failed to generate .m3u8 file in time.";
+//        }
+//    }
+//}
 
 //void mainwindows::liveSteamRecordRaido(QString mesg, QWebSocket* wClient) {
 //    QByteArray br = mesg.toUtf8();
@@ -1632,17 +2427,18 @@ QStringList mainwindows::findFile()
 }
 
 
+
+
 void mainwindows::playWavFile(const QString& filePath) {
     qDebug() << "Playing WAV file:" << filePath;
 
     QString safePath = QDir::cleanPath(filePath);
-
-    QString cmd = QString("ffplay -nodisp -autoexit -loglevel quiet '%1' &").arg(safePath);
+    QString cmd = QString("ffplay -nodisp -autoexit -loglevel quiet \"%1\" &").arg(safePath);
     qDebug() << "Command:" << cmd;
 
     int result = system(cmd.toUtf8().constData());
     if (result != 0) {
-        qWarning() << "Failed to execute ffplay command!";
+        qWarning() << "❌ Failed to execute ffplay command!";
     }
 }
 
@@ -1696,7 +2492,7 @@ void* mainwindows::ThreadFunc(void* pTr)
     mainwindows* pThis = static_cast<mainwindows*>(pTr);
     while (true) {
         emit pThis->getDateTime();
-        QThread::msleep(500);
+        QThread::msleep(1000);
     }
     return nullptr;
 }
@@ -1720,6 +2516,15 @@ void* mainwindows::ThreadFunc3(void* pTr)
     }
     return NULL;
 }
+
+
+
+//void mainwindows::autoLiveStream(QString) {
+
+//}
+
+
+
 void mainwindows::runBuildAndRestartServices() {
     QString workDir = "/home/orinnx/alphatest/irecd1.0.4/src/";
 
@@ -1754,6 +2559,7 @@ void mainwindows::runBuildAndRestartServices() {
 
     qDebug() << "Services restarted successfully.";
 }
+
 
 
 //    system("speaker-test -D hw:3,1 -r 8000  -c 2 -t sine -f 1000");
